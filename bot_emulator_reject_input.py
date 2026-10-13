@@ -33,6 +33,9 @@ except ImportError:
 
 d = None
 
+# Flag global status limit API check-idpln: jika limit terdeteksi, aktifkan True seterusnya untuk beralih ke Cek Nomor Meter
+MODE_CEK_NOMETER_AKTIF = False
+
 def hubungkan_emulator():
     """Menghubungkan ke emulator via uiautomator2 secara cepat"""
     global d
@@ -2188,9 +2191,20 @@ def input_textbox(label_text, value, bounds_fallback=None, exact=False, sleep_af
         try:
             target_input.click()
             time.sleep(SLEEP_SHORT)
+
+            # Wajib bersihkan (clear) isi field terlebih dahulu sebelum mengisi nilai baru
             try:
                 if hasattr(target_input, 'clear_text') and callable(target_input.clear_text):
                     target_input.clear_text()
+                elif check_exists(d(focused=True)):
+                    d(focused=True).clear_text()
+            except Exception:
+                pass
+
+            try:
+                d.press("ctrl+a")
+                time.sleep(0.05)
+                d.press("delete")
             except Exception:
                 pass
             
@@ -2211,6 +2225,14 @@ def input_textbox(label_text, value, bounds_fallback=None, exact=False, sleep_af
             try:
                 d.click(cx, cy)
                 time.sleep(SLEEP_SHORT)
+                try:
+                    if check_exists(d(focused=True)):
+                        d(focused=True).clear_text()
+                    d.press("ctrl+a")
+                    time.sleep(0.05)
+                    d.press("delete")
+                except Exception:
+                    pass
                 d.send_keys(val_str)
                 print(f"[INPUT] Berhasil mengisi '{label_text}' via koordinat ({cx}, {cy}): '{val_str}'")
                 success = True
@@ -2221,6 +2243,14 @@ def input_textbox(label_text, value, bounds_fallback=None, exact=False, sleep_af
             try:
                 d.click(540, 1156)
                 time.sleep(SLEEP_SHORT)
+                try:
+                    if check_exists(d(focused=True)):
+                        d(focused=True).clear_text()
+                    d.press("ctrl+a")
+                    time.sleep(0.05)
+                    d.press("delete")
+                except Exception:
+                    pass
                 d.send_keys(val_str)
                 print(f"[INPUT] Berhasil mengisi '{label_text}' via koordinat (540, 1156): '{val_str}'")
                 success = True
@@ -2496,6 +2526,19 @@ def isi_dan_verifikasi_no_telp(d_dev, target_val="-", max_attempts=5):
         if tb_bounds:
             d_dev.click(tb_bounds[0], tb_bounds[1])
             time.sleep(0.3)
+            # Pastikan teks lama dibersihkan terlebih dahulu sebelum send_keys
+            try:
+                if check_exists(d_dev(focused=True)):
+                    d_dev(focused=True).clear_text()
+            except Exception:
+                pass
+            try:
+                d_dev.press("ctrl+a")
+                time.sleep(0.05)
+                d_dev.press("delete")
+            except Exception:
+                pass
+
             try:
                 if hasattr(d_dev, 'send_keys'):
                     d_dev.send_keys(target_val)
@@ -2556,36 +2599,42 @@ def ambil_data_alamat(file_output="temp_alamat.txt", idpel=""):
 
         # Cek jika terdeteksi teks mengandung kata "tidak match" saat scroll/ambil data alamat
         if "tidak match" in xml_lower or (not xml and check_exists(d(textContains="tidak match"))):
-            print(f"[BLOK I] [TIDAK MATCH] Terdeteksi 'tidak match' pada swipe ke-{swipe_idx}! Mencari & mengetuk tombol 'Cek ID Pelanggan'...")
-            btn_cek = d(textContains="Cek ID Pelanggan") or d(textContains="CEK ID PELANGGAN") or d(descriptionContains="Cek ID Pelanggan")
-            if check_exists(btn_cek):
-                try:
-                    btn_cek.click()
-                    print("[BLOK I] [TIDAK MATCH] Tombol 'Cek ID Pelanggan' berhasil diketuk.")
-                except Exception as e:
-                    print(f"[BLOK I] [WARNING] Gagal mengetuk tombol 'Cek ID Pelanggan': {e}")
-                    ketuk("Cek ID Pelanggan")
-            else:
-                print("[BLOK I] [RETRY] Mengetuk tombol 'Cek ID Pelanggan' via ketuk()...")
-                ketuk("Cek ID Pelanggan")
-
-            print("[BLOK I] [LOADING] Menunggu loading 'Cek ID Pelanggan' selesai...")
-            tunggu_loading(timeout=30)
-            time.sleep(SLEEP_SHORT)
-
-            # Cek jika terdeteksi teks limit API check-idpln setelah ketuk Cek ID Pelanggan
-            limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
-            try:
-                xml_after_cek = d.dump_hierarchy().lower()
-                is_cek_limit = "check-idpln sudah terlampaui" in xml_after_cek or "terlampaui (limit)" in xml_after_cek or check_exists(d(textContains=limit_msg))
-            except Exception:
-                is_cek_limit = check_exists(d(textContains=limit_msg))
-
-            if is_cek_limit:
-                print(f"[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln pada swipe ke-{swipe_idx}! Beralih ke 'Cek Nomor Meter'...")
+            global MODE_CEK_NOMETER_AKTIF
+            if MODE_CEK_NOMETER_AKTIF:
+                print(f"[BLOK I] [TIDAK MATCH] Terdeteksi 'tidak match' (Mode No Meter Aktif). Langsung mengetuk 'Cek Nomor Meter'...")
                 eksekusi_ketuk_cek_nometer(arah_awal="down")
             else:
-                print("[BLOK I] Loading selesai. Melanjutkan swipe & pengambilan data alamat...")
+                print(f"[BLOK I] [TIDAK MATCH] Terdeteksi 'tidak match' pada swipe ke-{swipe_idx}! Mencari & mengetuk tombol 'Cek ID Pelanggan'...")
+                btn_cek = d(textContains="Cek ID Pelanggan") or d(textContains="CEK ID PELANGGAN") or d(descriptionContains="Cek ID Pelanggan")
+                if check_exists(btn_cek):
+                    try:
+                        btn_cek.click()
+                        print("[BLOK I] [TIDAK MATCH] Tombol 'Cek ID Pelanggan' berhasil diketuk.")
+                    except Exception as e:
+                        print(f"[BLOK I] [WARNING] Gagal mengetuk tombol 'Cek ID Pelanggan': {e}")
+                        ketuk("Cek ID Pelanggan")
+                else:
+                    print("[BLOK I] [RETRY] Mengetuk tombol 'Cek ID Pelanggan' via ketuk()...")
+                    ketuk("Cek ID Pelanggan")
+
+                print("[BLOK I] [LOADING] Menunggu loading 'Cek ID Pelanggan' selesai...")
+                tunggu_loading(timeout=30)
+                time.sleep(SLEEP_SHORT)
+
+                # Cek jika terdeteksi teks limit API check-idpln setelah ketuk Cek ID Pelanggan
+                limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
+                try:
+                    xml_after_cek = d.dump_hierarchy().lower()
+                    is_cek_limit = "check-idpln sudah terlampaui" in xml_after_cek or "terlampaui (limit)" in xml_after_cek or check_exists(d(textContains=limit_msg))
+                except Exception:
+                    is_cek_limit = check_exists(d(textContains=limit_msg))
+
+                if is_cek_limit:
+                    MODE_CEK_NOMETER_AKTIF = True
+                    print(f"[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln pada swipe ke-{swipe_idx}! Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan beralih ke 'Cek Nomor Meter'...")
+                    eksekusi_ketuk_cek_nometer(arah_awal="down")
+                else:
+                    print("[BLOK I] Loading selesai. Melanjutkan swipe & pengambilan data alamat...")
 
         # Cek target alamat ditemukan
         if "103." in xml or "nama pada id pelanggan" in xml_lower or (not xml and (d(textContains="103.").exists() or d(textContains="Nama pada ID Pelanggan").exists())):
@@ -3382,6 +3431,11 @@ def eksekusi_ketuk_cek_id_pelanggan(arah_awal="down"):
     Helper untuk mencari tombol 'Cek ID Pelanggan', memastikan posisi aman di layar,
     mengetuk tombol tersebut, dan menunggu loading selesai.
     """
+    global MODE_CEK_NOMETER_AKTIF
+    if MODE_CEK_NOMETER_AKTIF:
+        print("[BLOK I] [BYPASS] Mode Cek Nomor Meter sedang aktif. Mengalihkan langsung ke 'Cek Nomor Meter'...")
+        return eksekusi_ketuk_cek_nometer(arah_awal=arah_awal)
+
     print("[BLOK I] Men-scroll secara dinamis ke tombol 'Cek ID Pelanggan'...")
     try:
         d(scrollable=True).scroll.to(text="Cek ID Pelanggan")
@@ -3460,7 +3514,8 @@ def eksekusi_ketuk_cek_id_pelanggan(arah_awal="down"):
         is_limit_cek = check_exists(d(textContains=limit_msg))
 
     if is_limit_cek:
-        print("[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln! Mengetuk tombol 'Cek Nomor Meter'...")
+        MODE_CEK_NOMETER_AKTIF = True
+        print("[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln! Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan beralih ke 'Cek Nomor Meter'...")
         eksekusi_ketuk_cek_nometer(arah_awal="down")
         return
 
@@ -3483,7 +3538,8 @@ def eksekusi_ketuk_cek_id_pelanggan(arah_awal="down"):
         )
 
         if "check-idpln sudah terlampaui" in xml_cur or "terlampaui (limit)" in xml_cur or check_exists(d(textContains=limit_msg)):
-            print("[BLOK I] [LIMIT DETECTED] API check-idpln limit terdeteksi saat pengecekan rincian. Mengetuk tombol 'Cek Nomor Meter'...")
+            MODE_CEK_NOMETER_AKTIF = True
+            print("[BLOK I] [LIMIT DETECTED] API check-idpln limit terdeteksi saat pengecekan rincian. Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan beralih ke 'Cek Nomor Meter'...")
             eksekusi_ketuk_cek_nometer(arah_awal="down")
             break
 
@@ -3619,28 +3675,38 @@ def eksekusi_ketuk_cek_nometer(arah_awal="down"):
         print("[BLOK I] Mengetuk tombol 'Cek Nomor Meter' via ketuk()...")
         ketuk("Cek Nomor Meter")
 
-    # Retry jika loading belum muncul
-    time.sleep(0.5)
-    progress_el = d(resourceId="id.go.bpsfasih:id/card_progress")
-    if not progress_el.exists():
-        progress_el = d(className="android.widget.ProgressBar")
-
-    if not progress_el.exists():
-        print("[BLOK I] [RETRY] Loading belum terdeteksi, mencoba mengetuk ulang 'Cek Nomor Meter'...")
-        if btn_meter and check_exists(btn_meter):
-            btn_meter.click()
-        else:
-            ketuk("Cek Nomor Meter")
-
     print("[BLOK I] [LOADING] Menunggu loading 'Cek Nomor Meter' selesai...")
     tunggu_loading(timeout=30)
     time.sleep(SLEEP_SHORT)
+
+    # Pemeriksaan apakah API check-nometerpln juga limit (Kondisi Kedua API Limit - Opsi 1)
+    limit_meter_msg = "Permintaan API check-nometerpln sudah terlampaui (limit)."
+    is_meter_limit = False
+    try:
+        xml_after_meter = d.dump_hierarchy().lower()
+        if "check-nometerpln sudah terlampaui" in xml_after_meter or (
+            "terlampaui (limit)" in xml_after_meter and "check-nometer" in xml_after_meter
+        ) or check_exists(d(textContains=limit_meter_msg)):
+            is_meter_limit = True
+    except Exception:
+        is_meter_limit = check_exists(d(textContains=limit_meter_msg))
+
+    if is_meter_limit:
+        print("\n" + "=" * 65)
+        print("  [ALERT - KEDUA API TELAH MENCAPAI BATAS LIMIT!]")
+        print("  Permintaan API 'check-idpln' DAN 'check-nometerpln' sudah limit.")
+        print("  Server PLN/FASIH saat ini tidak dapat memvalidasi data.")
+        print("  [OPSI 1] Menghentikan seluruh proses bot secara aman...")
+        print("=" * 65 + "\n")
+        sys.exit(0)
+
     return True
 
 
 
 def proses_update_reject_nik():
     """Fungsi utama memproses list data reject untuk update NIK"""
+    global MODE_CEK_NOMETER_AKTIF
     data_reject = baca_data_reject(EXCEL_FILE)
     if not data_reject:
         print("[HALT] Tidak ada data reject yang dapat diproses.")
@@ -3859,8 +3925,13 @@ def proses_update_reject_nik():
                 ketuk("Dismiss", sleep_after=SLEEP_SHORT)
                 time.sleep(SLEEP_SHORT)
 
-                # Scroll ke bawah sampai ketemu "Cek ID Pelanggan" dan ketuk tombolnya
-                eksekusi_ketuk_cek_id_pelanggan(arah_awal="down")
+                # Cek apakah mode Cek Nomor Meter sudah aktif permanen untuk sesi ini
+                if MODE_CEK_NOMETER_AKTIF:
+                    print(f"[BLOK I] [MODE NOMETER AKTIF] IDPEL {idpel}: Langsung mencari & mengeksekusi 'Cek Nomor Meter'...")
+                    eksekusi_ketuk_cek_nometer(arah_awal="down")
+                else:
+                    # Scroll ke bawah sampai ketemu "Cek ID Pelanggan" dan ketuk tombolnya
+                    eksekusi_ketuk_cek_id_pelanggan(arah_awal="down")
             else:
                 print("[GALAT CHECK] [FALSE] Tidak terdeteksi kata 'Nomor Meter' / 'ID pelanggan PLN' setelah 3x pengecekan. Menutup modal...")
                 print("[DISMISS] Mengetuk tombol 'Dismiss' pertama (modal Galat)...")
@@ -3941,8 +4012,12 @@ def proses_update_reject_nik():
                     )
 
                     if is_mismatch_101a:
-                        print("[BLOK I] [MATCH] Terdeteksi teks 'tidak sama' (ID Pelanggan)! Mengetuk tombol 'Cek ID Pelanggan'...")
-                        eksekusi_ketuk_cek_id_pelanggan(arah_awal="up")
+                        if MODE_CEK_NOMETER_AKTIF:
+                            print("[BLOK I] [MODE NOMETER AKTIF] Terdeteksi teks 'tidak sama' (ID Pelanggan), dialihkan langsung ke 'Cek Nomor Meter'...")
+                            eksekusi_ketuk_cek_nometer(arah_awal="down")
+                        else:
+                            print("[BLOK I] [MATCH] Terdeteksi teks 'tidak sama' (ID Pelanggan)! Mengetuk tombol 'Cek ID Pelanggan'...")
+                            eksekusi_ketuk_cek_id_pelanggan(arah_awal="up")
                     else:
                         print("[BLOK I] Tidak terdeteksi galat Nomor Meter maupun ID Pelanggan. Melanjutkan ke data alamat...")
 
@@ -3959,8 +4034,9 @@ def proses_update_reject_nik():
                 is_limit_api_idpel = check_exists(d(textContains=limit_msg))
 
             if is_limit_api_idpel:
+                MODE_CEK_NOMETER_AKTIF = True
                 print(f"[BLOK I] [LIMIT DETECTED] Muncul teks '{limit_msg}' sebelum ambil data alamat!")
-                print("[BLOK I] Men-scroll dinamis mencari & mengetuk tombol 'Cek Nomor Meter'...")
+                print("[BLOK I] Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan men-scroll dinamis mencari & mengetuk tombol 'Cek Nomor Meter'...")
                 eksekusi_ketuk_cek_nometer(arah_awal="down")
 
             alamat_dict = ambil_data_alamat(file_output="temp_alamat.txt", idpel=idpel)
