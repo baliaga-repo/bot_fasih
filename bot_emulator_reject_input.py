@@ -2643,7 +2643,16 @@ def ambil_data_alamat(file_output="temp_alamat.txt", idpel=""):
         for p in patterns:
             el = d(textContains=p)
             if el.exists():
-                txt = el.info.get('text', '').strip()
+                # Elemen bisa hilang (re-render layar) antara exists() dan info; coba ulang dengan aman
+                txt = None
+                for _retry in range(3):
+                    try:
+                        txt = el.info.get('text', '').strip()
+                        break
+                    except Exception:
+                        time.sleep(0.3)
+                if txt is None:
+                    continue
                 if ":" in txt and len(txt) > len(p) + 2:
                     info_alamat[key] = f"{key}: {txt.split(':', 1)[1].strip()}"
                     break
@@ -2658,7 +2667,10 @@ def ambil_data_alamat(file_output="temp_alamat.txt", idpel=""):
                         sibling = el.down(className="android.widget.TextView")
 
                     if sibling.exists():
-                        val = sibling.info.get('text', '').strip()
+                        try:
+                            val = sibling.info.get('text', '').strip()
+                        except Exception:
+                            continue
                         if val and not any(val.startswith(x) for x in ["a. ", "b. ", "c. ", "d. ", "e. "]):
                             info_alamat[key] = f"{key}: {val}"
                             break
