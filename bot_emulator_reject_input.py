@@ -826,7 +826,37 @@ def perbaiki_galat_koordinat_foto(skip_ketuk_galat=False):
 
         foto_berhasil = False
 
-        # Cek kondisi awal di layar (siapa tahu sudah terunggah atau sudah dimuat dari local)
+        # 1. Deteksi tombol "Muat Ulang" di samping label foto jika ada
+        muat_ulang_btn = None
+        for sel_muat in [
+            d(text="Muat Ulang"),
+            d(text="MUAT ULANG"),
+            d(text="muat ulang"),
+            d(textContains="Muat Ulang"),
+            d(textContains="muat ulang"),
+            d(descriptionContains="Muat Ulang"),
+            d(descriptionContains="muat ulang"),
+        ]:
+            if check_exists(sel_muat):
+                muat_ulang_btn = sel_muat
+                break
+
+        if muat_ulang_btn:
+            print("[GALAT FIX] Terdeteksi tombol 'Muat Ulang' pada foto. Mengetuk 'Muat Ulang'...")
+            try:
+                muat_ulang_btn.click()
+                time.sleep(1.5)
+            except Exception as err_muat:
+                print(f"[WARNING] Gagal mengetuk tombol 'Muat Ulang': {err_muat}")
+
+            # Pantau pembaruan status setelah 'Muat Ulang' diketuk
+            for _ in range(3):
+                time.sleep(1.0)
+                st = cek_status_foto_di_layar()
+                if st in ["sudah_terunggah", "dimuat_local"]:
+                    break
+
+        # 2. Cek kondisi awal di layar (siapa tahu sudah terunggah atau sudah dimuat dari local)
         status_awal = cek_status_foto_di_layar()
         if status_awal == "sudah_terunggah":
             print("[GALAT FIX] [SUKSES] Foto sudah terunggah / aktif di layar. Melewati proses upload.")
