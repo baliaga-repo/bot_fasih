@@ -3857,25 +3857,49 @@ def proses_update_reject_nik():
                         print(f"[BLOK I] [WARNING] Gagal swipe: {e}")
                         break
 
-                # Scan halaman: jika menemukan text "tidak sama"
-                print("[BLOK I] Memeriksa teks 'tidak sama' pada halaman...")
+                # Scan halaman: memverifikasi galat Nomor Meter (101b) vs ID Pelanggan (101a)
+                print("[BLOK I] Memeriksa keberadaan galat Nomor Meter (101b) pada halaman...")
                 try:
                     xml_page = d.dump_hierarchy().lower()
                 except Exception:
                     xml_page = ""
 
-                is_mismatch_101b = (
-                    "tidak sama" in xml_page or
-                    check_exists(d(textContains="tidak sama")) or
-                    check_exists(d(descriptionContains="tidak sama")) or
-                    check_exists(d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tidak sama') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tidak sama')]"))
+                # 1. Cek Galat Nomor Meter (101b)
+                is_galat_101b = (
+                    "101b. nomor meter" in xml_page or
+                    "rincian 101b tidak sama dengan hasil cek nomor meter" in xml_page or
+                    "rincian 101b tidak sama" in xml_page or
+                    "101b tidak sama" in xml_page or
+                    check_exists(d(textContains="101b. Nomor Meter")) or
+                    check_exists(d(textContains="101b. Nomor meter")) or
+                    check_exists(d(textContains="Rincian 101b tidak sama dengan hasil Cek Nomor meter")) or
+                    check_exists(d(textContains="Rincian 101b tidak sama")) or
+                    check_exists(d(descriptionContains="101b. Nomor Meter")) or
+                    check_exists(d(descriptionContains="101b. Nomor meter")) or
+                    check_exists(d(descriptionContains="Rincian 101b tidak sama dengan hasil Cek Nomor meter")) or
+                    check_exists(d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '101b. nomor meter') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b tidak sama') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '101b. nomor meter') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b tidak sama')]"))
                 )
 
-                if is_mismatch_101b:
-                    print("[BLOK I] [MATCH] Terdeteksi teks 'tidak sama'! Mengetuk tombol 'Cek ID Pelanggan'...")
-                    eksekusi_ketuk_cek_id_pelanggan(arah_awal="up")
+                if is_galat_101b:
+                    print("[BLOK I] [MATCH] Terdeteksi galat Nomor Meter (101b)! Mengetuk tombol 'Cek Nomor Meter'...")
+                    eksekusi_ketuk_cek_nometer(arah_awal="down")
+                    time.sleep(SLEEP_SHORT)
                 else:
-                    print("[BLOK I] Tidak terdeteksi teks 'tidak sama'. Melanjutkan ke data alamat...")
+                    # 2. Cek apakah ada ketidakcocokan ID Pelanggan (101a / teks 'tidak sama')
+                    is_mismatch_101a = (
+                        "tidak sama" in xml_page or
+                        "rincian 101a" in xml_page or
+                        check_exists(d(textContains="tidak sama")) or
+                        check_exists(d(textContains="Rincian 101a")) or
+                        check_exists(d(descriptionContains="tidak sama")) or
+                        check_exists(d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tidak sama') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tidak sama')]"))
+                    )
+
+                    if is_mismatch_101a:
+                        print("[BLOK I] [MATCH] Terdeteksi teks 'tidak sama' (ID Pelanggan)! Mengetuk tombol 'Cek ID Pelanggan'...")
+                        eksekusi_ketuk_cek_id_pelanggan(arah_awal="up")
+                    else:
+                        print("[BLOK I] Tidak terdeteksi galat Nomor Meter maupun ID Pelanggan. Melanjutkan ke data alamat...")
 
             # Scan sebelum ambil_data_alamat(): apakah muncul limit API check-idpln setelah loading Cek ID Pelanggan
             limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
