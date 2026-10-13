@@ -20,12 +20,27 @@ from konfigurasi import (
 try:
     from konfigurasi import EXCEL_FILE_REJECT_2 as EXCEL_FILE
 except ImportError:
-    EXCEL_FILE = "data_reject2.xlsx"
+    EXCEL_FILE = "data_reject2.xlsx" 
 
-# Flag sesi: jika API check-idpln limit, seluruh baris berikutnya dialihkan ke "Cek Nomor Meter"
-MODE_CEK_NOMETER_AKTIF = False
+# Ambil PAUSE_ON_GALAT_0 dengan fallback jika konfigurasi.py belum terupdate di PC lokal
+try:
+    from konfigurasi import PAUSE_ON_GALAT_0
+except ImportError:
+    PAUSE_ON_GALAT_0 = False
+
+# ==============================================================================
+# KONFIGURASI BOT REJECT INPUT
+# ==============================================================================
+# Variabel True / False untuk mengaktifkan atau menonaktifkan Pause saat GALAT 0:
+# True  : Pause proses saat GALAT 0 terdeteksi (pilihan: Stop seluruh proses atau Lanjutkan)
+# False : Nonaktifkan pause (proses submit otomatis langsung berlanjut)
+# (Nilai default diimpor dari konfigurasi.py, ubah di sini jika ingin override)
+# PAUSE_ON_GALAT_0 = True
 
 d = None
+
+# Flag global status limit API check-idpln: jika limit terdeteksi, aktifkan True seterusnya untuk beralih ke Cek Nomor Meter
+MODE_CEK_NOMETER_AKTIF = False
 
 def hubungkan_emulator():
     """Menghubungkan ke emulator via uiautomator2 secara cepat"""
@@ -606,6 +621,613 @@ def eksekusi_submit_dan_selesai(row, idpel, row_attempt):
         return "sukses"
 
 
+def perbaiki_galat_koordinat_foto(skip_ketuk_galat=False):
+    """
+    Ketika GALAT ≠ 0, coba perbaiki error '105. Koordinat lokasi meteran'
+    dan/atau '106. Foto rumah tampak depan' secara otomatis.
+    Foto langsung dipilih gambar pertama di galeri (tanpa pencarian IDPEL).
+
+    Args:
+        skip_ketuk_galat: Jika True, lewati langkah ketuk 'GALAT' (karena sudah diketuk sebelumnya,
+                          contoh: saat dipanggil dari validasi awal di proses_update_reject_nik).
+
+    Returns True jika berhasil diperbaiki, False jika error bukan 105/106.
+    """
+    print("\n[GALAT FIX] === MEMULAI PERBAIKAN ERROR GALAT ===")
+
+    # 1. Ketuk teks "GALAT" pada modal ringkasan validasi (skip jika sudah diketuk sebelumnya)
+    if not skip_ketuk_galat:
+        print("[GALAT FIX] Mengetuk 'GALAT' pada modal ringkasan validasi...")
+        sukses_galat = ketuk_tab_galat_dengan_verifikasi(max_retry=3)
+        if not sukses_galat:
+            print("[GALAT FIX] Tombol 'Lihat' tidak muncul setelah ketuk 'GALAT'. Membatalkan perbaikan.")
+            return False
+        time.sleep(SLEEP_SHORT)
+    else:
+        print("[GALAT FIX] Skip ketuk 'GALAT' (sudah diketuk sebelumnya).")
+
+    # 2. Cek apakah ada error 105 atau 106
+    has_105 = (
+        check_exists(d(textContains="105. Koordinat lokasi meteran")) or
+        check_exists(d(textContains="105.")) or
+        check_exists(d(descriptionContains="105."))
+    )
+    has_106 = (
+        check_exists(d(textContains="106. Foto rumah tampak depan")) or
+        check_exists(d(textContains="106.")) or
+        check_exists(d(descriptionContains="106."))
+    )
+
+    print(f"[GALAT FIX] Deteksi error: 105 (Koordinat)={has_105}, 106 (Foto)={has_106}")
+
+    if not has_105 and not has_106:
+        print("[GALAT FIX] Error bukan 105/106. Tidak bisa diperbaiki otomatis.")
+        return False
+
+    # 3. Ketuk tombol "Lihat" untuk navigasi ke field bermasalah
+    print("[GALAT FIX] Mengetuk tombol 'Lihat'...")
+    lihat_clicked = ketuk("Lihat", sleep_after=SLEEP_SHORT)
+    if not lihat_clicked:
+        lihat_clicked = ketuk("lihat", sleep_after=SLEEP_SHORT)
+    if not lihat_clicked:
+        lihat_clicked = ketuk("LIHAT", sleep_after=SLEEP_SHORT)
+
+    if not lihat_clicked:
+        print("[GALAT FIX] Tombol 'Lihat' tidak ditemukan. Membatalkan.")
+        return False
+
+    time.sleep(SLEEP_MEDIUM)
+
+    # 4. Tunggu halaman field dimuat, lalu scroll mentok ke bawah
+    print("[GALAT FIX] Menunggu halaman field dimuat (2 detik)...")
+    time.sleep(2.0)
+
+    print("[GALAT FIX] Men-scroll mentok ke bawah untuk menemukan field 105/106...")
+    for scroll_idx in range(1, 16):
+        # Cek apakah sudah terlihat teks terkait 105/106 atau tombol "Pilih" / "Ambil Lokasi"
+        if (check_exists(d(textContains="Koordinat lokasi meteran")) or
+            check_exists(d(textContains="Foto rumah tampak depan")) or
+            check_exists(d(text="Pilih", className="android.widget.Button")) or
+            check_exists(d(text="Ambil Lokasi"))):
+            print(f"[GALAT FIX] Field / tombol terkait ditemukan (scroll ke-{scroll_idx}).")
+            break
+        try:
+            d.swipe(540, 1400, 540, 400, duration=0.1)
+            time.sleep(0.3)
+        except Exception:
+            break
+    time.sleep(SLEEP_SHORT)
+
+    print("[GALAT FIX] Halaman field siap diproses.")
+
+    # ======================================================================
+    # 5. Fix 106: Upload foto jika error 106 terdeteksi
+    # ======================================================================
+    if has_106:
+        print("\n[GALAT FIX] === MEMPERBAIKI ERROR 106: FOTO RUMAH TAMPAK DEPAN ===")
+
+        def cek_status_foto_di_layar():
+            """
+            Mengecek status foto di layar:
+            - 'sudah_terunggah' jika foto sudah terunggah / dari server
+            - 'dimuat_local' jika foto sudah dimuat secara lokal (tombol Unggah Foto siap diklik)
+            - None jika belum ada foto
+            """
+            for sel in [
+                d(textContains="Sudah Terunggah"),
+                d(textContains="sudah terunggah"),
+                d(textContains="Dimuat dari server"),
+                d(textContains="dimuat dari server"),
+                d(textMatches=r"(?i).*(sudah terunggah|dimuat dari server).*"),
+            ]:
+                if check_exists(sel):
+                    return "sudah_terunggah"
+
+            for sel in [
+                d(textContains="Dimuat dari local"),
+                d(textContains="Dimuat dari lokal"),
+                d(textContains="dimuat dari local"),
+                d(textContains="dimuat dari lokal"),
+                d(text="Unggah Foto"),
+                d(textContains="Unggah Foto"),
+                d(textMatches=r"(?i).*dimuat dari lo[ck]al.*"),
+            ]:
+                if check_exists(sel):
+                    return "dimuat_local"
+
+            return None
+
+        def scroll_ke_atas_setengah_layar():
+            """Melakukan scroll ke atas setengah layar saja"""
+            print("[GALAT FIX] Melakukan scroll ke atas setengah layar saja...")
+            try:
+                info = d.info
+                w = info.get('displayWidth', 1080)
+                h = info.get('displayHeight', 1920)
+            except Exception:
+                w, h = 1080, 1920
+            cx = w // 2
+            start_y = int(h * 0.3)
+            end_y = int(h * 0.8)
+            try:
+                d.swipe(cx, start_y, cx, end_y, duration=0.2)
+            except Exception:
+                try:
+                    d.shell(f"input swipe {cx} {start_y} {cx} {end_y} 200")
+                except Exception:
+                    pass
+            time.sleep(SLEEP_SHORT)
+
+        def eksekusi_unggah_foto():
+            """Mengetuk tombol Unggah Foto -> konfirmasi Ya -> tunggu status Sudah Terunggah"""
+            print("[GALAT FIX] Mengetuk tombol 'Unggah Foto'...")
+            unggah_btn = None
+            for sel in [
+                d(text="Unggah Foto"),
+                d(textContains="Unggah Foto"),
+                d(text="Unggah"),
+                d(text="UNGGAH"),
+                d(textContains="Unggah"),
+            ]:
+                if check_exists(sel):
+                    unggah_btn = sel
+                    break
+
+            if unggah_btn:
+                try:
+                    unggah_btn.click()
+                except Exception as e:
+                    print(f"[WARNING] Gagal klik tombol unggah: {e}")
+                time.sleep(1.0)
+
+                # Konfirmasi Ya
+                ya_btn = None
+                for ya in [d(text="Ya"), d(text="YA"), d(text="ya"), d(textContains="Ya")]:
+                    if check_exists(ya):
+                        ya_btn = ya
+                        break
+                if ya_btn:
+                    print("[GALAT FIX] Menyetujui konfirmasi unggah ('Ya')...")
+                    try:
+                        ya_btn.click()
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+
+            # Polling tunggu status 'Sudah Terunggah' (timeout 15s)
+            print("[GALAT FIX] Memindai layar menunggu status 'Sudah Terunggah'...")
+            for scan_idx in range(1, 16):
+                time.sleep(1.0)
+                status = cek_status_foto_di_layar()
+                if status == "sudah_terunggah":
+                    print(f"[GALAT FIX] [SUKSES] Status 'Sudah Terunggah' terkonfirmasi (+{scan_idx}s)!")
+                    scroll_ke_atas_setengah_layar()
+                    return True
+                if scan_idx == 6 and status == "dimuat_local":
+                    print("[GALAT FIX] Mencoba mengetuk 'Unggah Foto' ulang...")
+                    for sel in [d(text="Unggah Foto"), d(textContains="Unggah Foto"), d(text="Unggah")]:
+                        if check_exists(sel):
+                            try:
+                                sel.click()
+                                time.sleep(1.0)
+                                ya = d(text="Ya")
+                                if check_exists(ya):
+                                    ya.click()
+                            except Exception:
+                                pass
+                            break
+
+            if cek_status_foto_di_layar() == "sudah_terunggah":
+                print("[GALAT FIX] [SUKSES] Status 'Sudah Terunggah' terkonfirmasi!")
+                scroll_ke_atas_setengah_layar()
+                return True
+            return False
+
+        # Scroll statis 3x ke bawah lalu cek status / ketuk 'Pilih'
+        print("[GALAT FIX] Men-scroll statis 3x ke bawah...")
+        for i in range(3):
+            try:
+                d.swipe(540, 1400, 540, 400, duration=0.1)
+                time.sleep(0.3)
+            except Exception:
+                pass
+        time.sleep(SLEEP_SHORT)
+
+        foto_berhasil = False
+
+        # 1. Deteksi tombol "Muat Ulang" di samping label foto jika ada
+        muat_ulang_btn = None
+        for sel_muat in [
+            d(text="Muat Ulang"),
+            d(text="MUAT ULANG"),
+            d(text="muat ulang"),
+            d(textContains="Muat Ulang"),
+            d(textContains="muat ulang"),
+            d(descriptionContains="Muat Ulang"),
+            d(descriptionContains="muat ulang"),
+        ]:
+            if check_exists(sel_muat):
+                muat_ulang_btn = sel_muat
+                break
+
+        if muat_ulang_btn:
+            print("[GALAT FIX] Terdeteksi tombol 'Muat Ulang' pada foto. Mengetuk 'Muat Ulang'...")
+            try:
+                muat_ulang_btn.click()
+                time.sleep(1.5)
+            except Exception as err_muat:
+                print(f"[WARNING] Gagal mengetuk tombol 'Muat Ulang': {err_muat}")
+
+            # Pantau pembaruan status setelah 'Muat Ulang' diketuk
+            for _ in range(3):
+                time.sleep(1.0)
+                st = cek_status_foto_di_layar()
+                if st in ["sudah_terunggah", "dimuat_local"]:
+                    break
+
+        # 2. Cek kondisi awal di layar (siapa tahu sudah terunggah atau sudah dimuat dari local)
+        status_awal = cek_status_foto_di_layar()
+        if status_awal == "sudah_terunggah":
+            print("[GALAT FIX] [SUKSES] Foto sudah terunggah / aktif di layar. Melewati proses upload.")
+            foto_berhasil = True
+        elif status_awal == "dimuat_local":
+            print("[GALAT FIX] Foto sudah ada di layar ('Dimuat dari local'). Langsung memproses unggah...")
+            if eksekusi_unggah_foto():
+                foto_berhasil = True
+
+        # Jika belum berhasil, jalankan alur pemilihan foto dari galeri
+        if not foto_berhasil:
+            for attempt in range(1, 3):
+                print(f"\n[GALAT FIX] === SELEKSI FOTO (Percobaan {attempt}/2) ===")
+
+                time.sleep(0.5)
+
+                # Cari dan klik tombol "Pilih"
+                pilih_foto_clicked = False
+                for try_pilih in range(3):
+                    try:
+                        pilih_foto_btn = d(text="Pilih", className="android.widget.Button")
+                        if not pilih_foto_btn.exists():
+                            pilih_foto_btn = d(text="Pilih")
+                        if pilih_foto_btn.exists(timeout=3):
+                            print(f"[GALAT FIX] Mengetuk tombol 'Pilih'...")
+                            pilih_foto_btn.click()
+                            pilih_foto_clicked = True
+                            time.sleep(SLEEP_MEDIUM)
+                            break
+                        else:
+                            time.sleep(0.5)
+                    except Exception as err_pilih:
+                        print(f"[WARNING] Gagal mengetuk 'Pilih' (percobaan {try_pilih+1}): {err_pilih}")
+                        time.sleep(0.5)
+
+                if not pilih_foto_clicked:
+                    if cek_status_foto_di_layar() == "sudah_terunggah":
+                        print("[GALAT FIX] Tombol 'Pilih' tidak ada, namun foto sudah terunggah!")
+                        foto_berhasil = True
+                        break
+                    print("[WARNING] Tombol 'Pilih' tidak dapat diklik. Menekan BACK 2x, skip upload foto...")
+                    for _ in range(2):
+                        d.press("back")
+                        time.sleep(SLEEP_SHORT)
+                    foto_berhasil = True
+                    break
+
+                # Ketuk GALERI
+                print("[GALAT FIX] Mengetuk opsi 'GALERI'...")
+                galeri_btn = d(text="GALERI")
+                if not galeri_btn.exists(): galeri_btn = d(text="Galeri")
+                if not galeri_btn.exists(): galeri_btn = d(text="galeri")
+                if galeri_btn.exists(timeout=5):
+                    galeri_btn.click()
+                    time.sleep(SLEEP_MEDIUM)
+                else:
+                    print("[WARNING] 'GALERI' tidak ditemukan. Skip percobaan ini...")
+                    d.press("back")
+                    time.sleep(SLEEP_SHORT)
+                    continue
+
+                # Ketuk burger menu
+                print("[GALAT FIX] Mengetuk ikon burger...")
+                burger_btn = None
+                for desc in ["Show roots", "Tampilkan laci", "Tampilkan root", "Show navigation drawer", "Open navigation drawer", "Laci navigasi", "Menu"]:
+                    if d(descriptionContains=desc).exists():
+                        burger_btn = d(descriptionContains=desc)
+                        break
+                if not burger_btn:
+                    for res_id in ["android:id/home", "com.android.documentsui:id/toolbar"]:
+                        if d(resourceId=res_id).exists():
+                            burger_btn = d(resourceId=res_id)
+                            break
+                if not burger_btn:
+                    image_buttons = d(className="android.widget.ImageButton")
+                    if image_buttons.exists():
+                        burger_btn = image_buttons[0]
+
+                if burger_btn and burger_btn.exists(timeout=5):
+                    burger_btn.click()
+                    time.sleep(SLEEP_SHORT)
+                else:
+                    print("[WARNING] Ikon burger tidak ditemukan, mencoba melanjutkan...")
+
+                # Ketuk Recent / Baru-baru ini / Terbaru
+                print("[GALAT FIX] Mengetuk opsi 'Recent' atau 'Baru-baru ini'...")
+                recent_btn = None
+                recent_keywords = [
+                    "Recent", "recent",
+                    "Baru-baru ini", "baru-baru ini",
+                    "Baru - baru ini", "baru - baru ini",
+                    "Baru baru ini", "baru baru ini",
+                    "Terbaru", "terbaru"
+                ]
+                for text_val in recent_keywords:
+                    if d(text=text_val, resourceId="android:id/title").exists():
+                        recent_btn = d(text=text_val, resourceId="android:id/title")
+                        break
+                    elif d(text=text_val, resourceId="com.android.documentsui:id/title").exists():
+                        recent_btn = d(text=text_val, resourceId="com.android.documentsui:id/title")
+                        break
+                if not recent_btn:
+                    for text_val in recent_keywords:
+                        if d(text=text_val).exists():
+                            recent_btn = d(text=text_val)
+                            break
+                if not recent_btn:
+                    for text_val in ["Recent", "Baru-baru ini", "Baru baru ini", "Terbaru", "recent", "baru-baru ini", "terbaru"]:
+                        if d(textContains=text_val).exists():
+                            recent_btn = d(textContains=text_val)
+                            break
+                if not recent_btn:
+                    try:
+                        xpath_recent = d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'recent') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'baru-baru') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'baru baru') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'terbaru')]")
+                        if xpath_recent.exists:
+                            recent_btn = xpath_recent
+                    except Exception:
+                        pass
+
+                if recent_btn and recent_btn.exists(timeout=5):
+                    print("[GALAT FIX] Opsi 'Recent'/'Baru-baru ini' ditemukan. Mengetuk...")
+                    recent_btn.click()
+                    time.sleep(1.5)
+                else:
+                    print("[WARNING] 'Recent' / 'Baru-baru ini' tidak ditemukan, mencoba melanjutkan...")
+
+                # === LANGSUNG PILIH GAMBAR PERTAMA (tanpa search IDPEL) ===
+                print("[GALAT FIX] Memilih gambar pertama di galeri (tanpa pencarian IDPEL)...")
+                time.sleep(1.5)
+
+                first_file_btn = None
+
+                # Metode 1: com.android.documentsui:id/nameplate (kartu teks file: nama, ukuran, tanggal di grid)
+                try:
+                    nameplates = d(resourceId="com.android.documentsui:id/nameplate")
+                    if nameplates.exists() and len(nameplates) > 0:
+                        first_file_btn = nameplates[0]
+                        print("[GALAT FIX] Menemukan file via nameplate[0].")
+                except Exception:
+                    pass
+
+                # Metode 2: android:id/title yang BUKAN nama folder header
+                if not first_file_btn:
+                    try:
+                        folder_names = [
+                            "pictures", "images", "gambar", 
+                            "recent", "terbaru", 
+                            "baru-baru ini", "baru - baru ini", "baru baru ini",
+                            "downloads", "audio", "videos"
+                        ]
+                        for el in d(resourceId="android:id/title"):
+                            txt = el.info.get('text', '').strip()
+                            if txt and txt.lower() not in folder_names:
+                                first_file_btn = el
+                                print(f"[GALAT FIX] Menemukan file via title: '{txt}'.")
+                                break
+                    except Exception:
+                        pass
+
+                # Metode 3: Elemen dengan ekstensi gambar (.jpg, .png, dsb)
+                if not first_file_btn:
+                    for ext in [".jpg", ".png", ".jpeg", ".JPG", ".PNG", ".JPEG"]:
+                        el_ext = d(textContains=ext)
+                        if el_ext.exists():
+                            first_file_btn = el_ext
+                            print(f"[GALAT FIX] Menemukan file via ekstensi '{ext}'.")
+                            break
+
+                if first_file_btn and first_file_btn.exists():
+                    bounds = first_file_btn.info.get('bounds')
+                    click_x = (bounds['left'] + bounds['right']) // 2
+                    click_y = (bounds['top'] + bounds['bottom']) // 2
+                    print(f"[GALAT FIX] Mengklik item file pertama: ({click_x}, {click_y})")
+                    d.click(click_x, click_y)
+                else:
+                    print("[GALAT FIX] Mengklik koordinat default file pertama (342, 998)...")
+                    d.click(342, 998)
+
+                # Waktu tunggu jeda agar galeri selesai menutup dan kembali ke Fasih
+                time.sleep(1.5)
+
+                # Jika masih berada di documentsui (file picker), periksa tombol konfirmasi atau klik ulang
+                for check_try in range(3):
+                    cur_pkg = d.info.get('currentPackageName')
+                    if cur_pkg != "com.android.documentsui":
+                        break
+                    print(f"[GALAT FIX] Masih di galeri (pemeriksaan {check_try+1}/3), memeriksa tombol OPEN/BUKA...")
+                    open_clicked = False
+                    for open_txt in ["OPEN", "Open", "OPENS", "BUKA", "Buka", "SELESAI", "Selesai"]:
+                        btn = d(text=open_txt)
+                        if btn.exists():
+                            print(f"[GALAT FIX] Mengetuk tombol konfirmasi '{open_txt}'...")
+                            btn.click()
+                            open_clicked = True
+                            time.sleep(1.5)
+                            break
+
+                    if not open_clicked:
+                        # Coba ketuk sekali lagi pada koordinat kartu file
+                        print("[GALAT FIX] Mengetuk ulang kartu file (342, 998)...")
+                        d.click(342, 998)
+                        time.sleep(1.5)
+
+                # Memindai status secara berulang (polling scan sampai 20 detik)
+                print("[GALAT FIX] Memindai layar secara berkala untuk mendeteksi 'Dimuat dari local' atau 'Sudah Terunggah'...")
+                scan_berhasil = False
+                for scan_step in range(1, 21):
+                    status = cek_status_foto_di_layar()
+                    if status == "sudah_terunggah":
+                        print(f"[GALAT FIX] [SUKSES] 'Sudah Terunggah' terdeteksi pada pemindaian ke-{scan_step} (+{scan_step}s)!")
+                        scroll_ke_atas_setengah_layar()
+                        foto_berhasil = True
+                        scan_berhasil = True
+                        break
+                    elif status == "dimuat_local":
+                        print(f"[GALAT FIX] 'Dimuat dari local' terdeteksi pada pemindaian ke-{scan_step} (+{scan_step}s). Memproses unggah...")
+                        if eksekusi_unggah_foto():
+                            foto_berhasil = True
+                            scan_berhasil = True
+                        break
+
+                    time.sleep(1.0)
+
+                if scan_berhasil or foto_berhasil:
+                    break
+                else:
+                    print(f"[WARNING] Pemindaian ke-20 selesai: Baik 'Dimuat dari local' maupun 'Sudah Terunggah' belum terdeteksi pada percobaan {attempt}.")
+
+        if not foto_berhasil:
+            print("[WARNING] Gagal mengunggah foto setelah 2x percobaan. Melanjutkan perbaikan lain...")
+
+    # ======================================================================
+    # 6. Fix 105: Ambil lokasi GPS jika error 105 terdeteksi
+    # ======================================================================
+    if has_105:
+        print("\n[GALAT FIX] === MEMPERBAIKI ERROR 105: KOORDINAT LOKASI METERAN ===")
+
+        # Scroll untuk menemukan "Ambil Lokasi" (cari ke bawah, lalu ke atas jika belum ada)
+        ambil_lokasi_btn = d(text="Ambil Lokasi")
+        if not ambil_lokasi_btn.exists():
+            print("[GALAT FIX] Tombol 'Ambil Lokasi' tidak terdeteksi. Men-scroll ke bawah...")
+            for swipe_idx in range(1, 8):
+                if d(text="Ambil Lokasi").exists():
+                    print(f"[GALAT FIX] 'Ambil Lokasi' ditemukan (scroll bawah ke-{swipe_idx}).")
+                    break
+                try:
+                    d.swipe(540, 800, 540, 500, duration=0.1)
+                    time.sleep(0.2)
+                except Exception:
+                    break
+            time.sleep(0.2)
+
+        ambil_lokasi_btn = d(text="Ambil Lokasi")
+        if not ambil_lokasi_btn.exists():
+            print("[GALAT FIX] 'Ambil Lokasi' belum ditemukan. Men-scroll ke atas...")
+            for swipe_up_idx in range(1, 8):
+                if d(text="Ambil Lokasi").exists():
+                    print(f"[GALAT FIX] 'Ambil Lokasi' ditemukan (scroll atas ke-{swipe_up_idx}).")
+                    break
+                try:
+                    d.swipe(540, 500, 540, 800, duration=0.1)
+                    time.sleep(0.2)
+                except Exception:
+                    break
+            time.sleep(0.2)
+
+        ambil_lokasi_btn = d(text="Ambil Lokasi")
+        if ambil_lokasi_btn.wait(exists=True, timeout=5):
+            print("[GALAT FIX] Mengetuk 'Ambil Lokasi'...")
+            ambil_lokasi_btn.click()
+            time.sleep(SLEEP_SHORT)
+        else:
+            print("[WARNING] 'Ambil Lokasi' tidak ditemukan. Membatalkan perbaikan 105.")
+            return False
+
+        # Ketuk "AMBIL LANGSUNG"
+        print("[GALAT FIX] Mengetuk 'AMBIL LANGSUNG'...")
+        opsi_lokasi = d(resourceId="id.go.bpsfasih:id/lButton_bottomDialog")
+        if not opsi_lokasi.exists(): opsi_lokasi = d(text="AMBIL LANGSUNG")
+        if not opsi_lokasi.exists(): opsi_lokasi = d(textContains="LANGSUNG")
+
+        if opsi_lokasi.exists(timeout=5):
+            opsi_lokasi.click()
+            time.sleep(SLEEP_SHORT)
+        else:
+            print("[WARNING] 'AMBIL LANGSUNG' tidak ditemukan. Membatalkan perbaikan 105.")
+            return False
+
+        # Handle dialog konfirmasi keluar halaman
+        print("[GALAT FIX] Memeriksa dialog konfirmasi keluar halaman...")
+        dialog_keluar = d(text="Apakah Anda yakin akan keluar dari halaman ini ?")
+        if not dialog_keluar.exists():
+            dialog_keluar = d(textContains="Apakah Anda yakin akan keluar dari halaman ini")
+        if dialog_keluar.exists(timeout=2):
+            print("[WARNING] Dialog keluar halaman muncul. Menekan 'tidak'...")
+            tidak_btn = d(text="tidak")
+            if not tidak_btn.exists(): tidak_btn = d(text="Tidak")
+            if not tidak_btn.exists(): tidak_btn = d(text="TIDAK")
+            if tidak_btn.exists():
+                tidak_btn.click()
+                time.sleep(SLEEP_SHORT)
+
+        # Ketuk Ya konfirmasi lokasi
+        ya_lokasi = d(text="ya")
+        if not ya_lokasi.exists(): ya_lokasi = d(text="Ya")
+        if not ya_lokasi.exists(): ya_lokasi = d(text="YA")
+        if ya_lokasi.exists(timeout=5):
+            ya_lokasi.click()
+            time.sleep(SLEEP_MEDIUM)
+        else:
+            print("[WARNING] Dialog konfirmasi lokasi tidak muncul. Membatalkan perbaikan 105.")
+            return False
+
+        print("[GALAT FIX] Lokasi GPS berhasil diambil.")
+
+    print("[GALAT FIX] === PERBAIKAN GALAT SELESAI ===\n")
+    return True
+
+
+def pause_proses_galat_0(idpel="", row="", keterangan=""):
+    """
+    Fungsi Pause interaktif saat status 'GALAT 0' terdeteksi.
+    Diaktifkan atau dinonaktifkan via variabel PAUSE_ON_GALAT_0 (True/False).
+
+    Pilihan pengguna:
+    - Lanjutkan proses: ketuk submit dan lanjut ke data berikutnya
+    - Stop seluruh proses: bot berhenti sepenuhnya
+
+    Returns:
+        True  -> Melanjutkan proses
+        False -> Menghentikan seluruh proses bot
+    """
+    if not PAUSE_ON_GALAT_0:
+        return True
+
+    info_idpel = f"IDPEL: {idpel}" if idpel else ""
+    info_row = f"Baris: {row}" if row else ""
+    header_info = " | ".join(filter(None, [info_idpel, info_row]))
+    info_ket = f" [{keterangan}]" if keterangan else ""
+
+    print("\n" + "=" * 60)
+    print(f"  [PAUSE - GALAT 0 TERDETEKSI]{info_ket}")
+    if header_info:
+        print(f"  {header_info}")
+    print("=" * 60)
+    print("  Pilihan:")
+    print("  [1 / Enter / Y] : Lanjutkan proses submit data")
+    print("  [2 / S / Stop]  : Stop seluruh proses bot")
+    print("=" * 60)
+
+    try:
+        jawaban = input(">> Pilihan Anda [Default: Lanjut (Enter)]: ").strip().lower()
+        if jawaban in ["2", "s", "stop", "t", "tidak", "exit", "q", "keluar", "no", "n"]:
+            print("[STOP] Pengguna memilih untuk MENGHENTIKAN SELURUH PROSES bot.")
+            return False
+        print("[LANJUT] Pengguna memilih MELANJUTKAN proses submit...")
+        return True
+    except (KeyboardInterrupt, EOFError):
+        print("\n[STOP] Interupsi terdeteksi. Menghentikan seluruh proses bot.")
+        return False
+
+
 def isi_catatan_dan_submit(row, idpel, row_attempt):
     # Catatan
     input_textbox(label_text="Catatan", value='-', bounds_fallback=None, exact=False, sleep_after=SLEEP_SHORT)
@@ -635,6 +1257,46 @@ def isi_catatan_dan_submit(row, idpel, row_attempt):
             time.sleep(0.3)
 
         if not is_galat_0:
+            # === COBA PERBAIKI ERROR KOORDINAT/FOTO SECARA OTOMATIS ===
+            print(f"[SUBMIT] GALAT ≠ 0 terdeteksi untuk IDPEL {idpel}. Mencoba perbaikan otomatis...")
+            fix_berhasil = perbaiki_galat_koordinat_foto()
+
+            if fix_berhasil:
+                # Setelah perbaikan berhasil → ketuk Kirim → langsung eksekusi submit
+                print("[GALAT FIX] Perbaikan berhasil. Mengetuk 'Kirim' untuk re-submit...")
+                ketuk("Kirim", sleep_after=SLEEP_SHORT)
+                time.sleep(SLEEP_SHORT)
+
+                # Ketuk YA jika muncul konfirmasi
+                if check_exists(d(text="YA")) or check_exists(d(textContains="YA")):
+                    ketuk("YA", sleep_after=SLEEP_SHORT)
+                    time.sleep(SLEEP_SHORT)
+
+                # Tunggu status 'GALAT 0' muncul pada modal ringkasan validasi
+                print("[SUBMIT] Memeriksa status 'GALAT 0' setelah perbaikan otomatis...")
+                for galat_attempt in range(15):
+                    if (check_exists(d(textContains="GALAT 0 Perlu diperbaiki")) or 
+                        check_exists(d(textContains="GALAT 0")) or 
+                        check_exists(d(descriptionContains="GALAT 0")) or 
+                        check_exists(d.xpath("//*[contains(@text, 'GALAT 0') or contains(@content-desc, 'GALAT 0')]"))):
+                        print("[SUBMIT] 'GALAT 0' terdeteksi setelah perbaikan otomatis.")
+                        break
+                    time.sleep(0.3)
+
+                # Pause proses jika PAUSE_ON_GALAT_0 aktif
+                if not pause_proses_galat_0(idpel=idpel, row=row, keterangan="Setelah Perbaikan GALAT"):
+                    return "stop"
+
+                # Langsung jalankan alur eksekusi submit (Kirim kedua → Konfirmasi → YA → OK)
+                res_exec = eksekusi_submit_dan_selesai(row, idpel, row_attempt)
+                if res_exec == "retry_kirim" and submit_retry < max_submit_retries:
+                    print(f"[RETRY SUBMIT] Terdeteksi kembali ke BLOK IV setelah perbaikan GALAT. Mengulangi dari ketuk 'Kirim' (Percobaan {submit_retry + 1}/{max_submit_retries})...")
+                    time.sleep(SLEEP_SHORT)
+                    continue
+                else:
+                    return res_exec
+
+            # === FALLBACK: Jika perbaikan gagal (bukan error 105/106) ===
             is_blok_iv = (
                 check_exists(d(textContains="BLOK IV")) or
                 check_exists(d(textContains="Blok IV")) or
@@ -651,6 +1313,12 @@ def isi_catatan_dan_submit(row, idpel, row_attempt):
             simpan_status_excel(row, "koordinat & foto tidak ada")
             kembali_ke_daftar_assignment()
             return "next"
+
+        # === JIKA GALAT 0 TERDETEKSI SECARA LANGSUNG ===
+        print(f"[SUBMIT] 'GALAT 0' terdeteksi untuk IDPEL {idpel}.")
+        # Pause proses jika PAUSE_ON_GALAT_0 aktif
+        if not pause_proses_galat_0(idpel=idpel, row=row):
+            return "stop"
 
         res_exec = eksekusi_submit_dan_selesai(row, idpel, row_attempt)
         if res_exec == "retry_kirim" and submit_retry < max_submit_retries:
@@ -1052,6 +1720,86 @@ def ketuk(target_text, exact=False, sleep_after=SLEEP_SHORT):
     if sleep_after > 0:
         time.sleep(sleep_after)
     return success
+
+
+def ketuk_tab_galat_dengan_verifikasi(max_retry=3):
+    """
+    Mengetuk tab/teks 'GALAT' pada modal validasi dan memastikan apakah tombol 'Lihat'
+    sudah muncul di layar. Jika tombol 'Lihat' belum muncul, ulangi pengetukan maksimal max_retry kali.
+    """
+    for attempt in range(1, max_retry + 1):
+        print(f"[KLIK GALAT] Mencari dan mengetuk tab 'GALAT' (Percobaan {attempt}/{max_retry})...")
+
+        # 1. Prioritaskan klik koordinat tengah bounds jika elemen terdeteksi
+        galat_clicked = False
+        try:
+            galat_el = d(textContains="GALAT")
+            if not galat_el.exists():
+                galat_el = d(descriptionContains="GALAT")
+            if galat_el.exists():
+                b = galat_el.info.get("bounds", {})
+                cx = (b.get("left", 0) + b.get("right", 0)) // 2
+                cy = (b.get("top", 0) + b.get("bottom", 0)) // 2
+                if cx > 0 and cy > 0:
+                    d.click(cx, cy)
+                    galat_clicked = True
+        except Exception:
+            pass
+
+        # 2. Coba selector umum jika belum berhasil diklik
+        if not galat_clicked:
+            try:
+                galat_el = d(textContains="GALAT")
+                if not galat_el.exists():
+                    galat_el = d(descriptionContains="GALAT")
+                if galat_el.exists():
+                    galat_el.click()
+                    galat_clicked = True
+            except Exception:
+                pass
+
+        # 3. Fallback XPath / fungsi ketuk()
+        if not galat_clicked:
+            try:
+                xp = d.xpath("//*[contains(@text, 'GALAT') or contains(@content-desc, 'GALAT')]")
+                if xp.exists:
+                    xp.click()
+                    galat_clicked = True
+            except Exception:
+                pass
+
+        if not galat_clicked:
+            ketuk("GALAT", exact=False, sleep_after=SLEEP_SHORT)
+
+        time.sleep(0.5)
+
+        # 4. Verifikasi apakah tombol 'Lihat' sudah muncul di layar
+        btn_lihat = d(text="Lihat")
+        if not btn_lihat.exists():
+            btn_lihat = d(textContains="Lihat")
+        if not btn_lihat.exists():
+            btn_lihat = d(descriptionContains="Lihat")
+        if not btn_lihat.exists():
+            btn_lihat = d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'lihat') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'lihat')]")
+
+        is_lihat_muncul = check_exists(btn_lihat)
+        if not is_lihat_muncul:
+            try:
+                xml_check = d.dump_hierarchy().lower()
+                if "lihat" in xml_check:
+                    is_lihat_muncul = True
+            except Exception:
+                pass
+
+        if is_lihat_muncul:
+            print(f"[KLIK GALAT] [SUKSES] Tombol 'Lihat' terdeteksi (Percobaan {attempt}/{max_retry})! Tab 'GALAT' berhasil terbuka.")
+            return True
+        else:
+            print(f"[KLIK GALAT] [RETRY] Tombol 'Lihat' belum muncul setelah ketuk 'GALAT' (Percobaan {attempt}/{max_retry}). Mengulangi...")
+            time.sleep(0.4)
+
+    print(f"[KLIK GALAT] [WARNING] Tombol 'Lihat' belum terdeteksi setelah {max_retry}x percobaan.")
+    return False
 
 
 def check_dan_tutup_pengaturan():
@@ -1592,6 +2340,58 @@ def cek_nik_tidak_valid(d_dev):
     return False, ""
 
 
+def cek_nik_tidak_ditemukan(d_dev):
+    """
+    Melakukan scan halaman untuk mengonfirmasi apakah NIK tidak ditemukan:
+    - Teks 'NIK TIDAK DITEMUKAN' / 'nik tidak ditemukan' (case-insensitive) di text atau content-desc
+    - Card / section 'Hasil Pemadanan NIK' yang berstatus 'TIDAK DITEMUKAN'
+    Returns:
+        tuple (is_not_found: bool, pesan: str)
+    """
+    try:
+        # 1. Cek langsung teks yang mengandung "NIK TIDAK DITEMUKAN"
+        keywords = [
+            "NIK TIDAK DITEMUKAN",
+            "NIK Tidak Ditemukan",
+            "nik tidak ditemukan",
+            "Nik Tidak Ditemukan"
+        ]
+        for kw in keywords:
+            if check_exists(d_dev(textContains=kw)):
+                txt = d_dev(textContains=kw).info.get('text', '') or kw
+                return True, txt
+            if check_exists(d_dev(descriptionContains=kw)):
+                desc = d_dev(descriptionContains=kw).info.get('contentDescription', '') or kw
+                return True, desc
+
+        # 2. XPath case-insensitive untuk teks yang memuat 'nik tidak ditemukan'
+        xp_nik = "//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'nik tidak ditemukan') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'nik tidak ditemukan')]"
+        if check_exists(d_dev.xpath(xp_nik)):
+            nodes = d_dev.xpath(xp_nik).all()
+            if nodes:
+                txt = nodes[0].text if hasattr(nodes[0], 'text') and nodes[0].text else "NIK TIDAK DITEMUKAN"
+                return True, txt
+
+        # 3. Cek hasil pemadanan NIK dengan status 'TIDAK DITEMUKAN'
+        has_hasil_pemadanan = (
+            check_exists(d_dev(textContains="Hasil Pemadanan NIK")) or
+            check_exists(d_dev(descriptionContains="Hasil Pemadanan NIK"))
+        )
+        if has_hasil_pemadanan:
+            if check_exists(d_dev(textContains="TIDAK DITEMUKAN")) or check_exists(d_dev(descriptionContains="TIDAK DITEMUKAN")):
+                return True, "Hasil Pemadanan NIK: TIDAK DITEMUKAN"
+
+        # 4. Cek teks persis atau mengandung "TIDAK DITEMUKAN" di layar
+        if check_exists(d_dev(text="TIDAK DITEMUKAN")) or check_exists(d_dev(description="TIDAK DITEMUKAN")):
+            return True, "TIDAK DITEMUKAN"
+
+    except Exception as e:
+        print(f"[SCAN NIK] Exception saat memindai NIK tidak ditemukan: {e}")
+
+    return False, ""
+
+
+
 def cari_dan_scroll_ke_tombol_cek_nik(max_swipes=10):
     """
     Mencari terlebih dahulu tombol 'Cek NIK' sebelum mengetuknya.
@@ -1807,28 +2607,8 @@ def ambil_data_alamat(file_output="temp_alamat.txt", idpel=""):
         if "tidak match" in xml_lower or (not xml and check_exists(d(textContains="tidak match"))):
             global MODE_CEK_NOMETER_AKTIF
             if MODE_CEK_NOMETER_AKTIF:
-                print(f"[BLOK I] [TIDAK MATCH] Terdeteksi 'tidak match' (Mode No Meter Aktif). Mengetuk 'Cek Nomor Meter'...")
-                ketuk("Cek Nomor Meter")
-                print("[BLOK I] [LOADING] Menunggu loading 'Cek Nomor Meter' selesai...")
-                tunggu_loading(timeout=30)
-                time.sleep(SLEEP_SHORT)
-                limit_meter_msg = "Permintaan API check-nometerpln sudah terlampaui (limit)."
-                try:
-                    xml_after_meter = d.dump_hierarchy().lower()
-                    is_meter_limit = "check-nometerpln sudah terlampaui" in xml_after_meter or (
-                        "terlampaui (limit)" in xml_after_meter and "check-nometer" in xml_after_meter
-                    ) or check_exists(d(textContains=limit_meter_msg))
-                except Exception:
-                    is_meter_limit = check_exists(d(textContains=limit_meter_msg))
-
-                if is_meter_limit:
-                    print("\n" + "=" * 65)
-                    print("  [ALERT - KEDUA API TELAH MENCAPAI BATAS LIMIT!]")
-                    print("  Permintaan API 'check-idpln' DAN 'check-nometerpln' sudah limit.")
-                    print("  Server PLN/FASIH saat ini tidak dapat memvalidasi data.")
-                    print("  [OPSI 1] Menghentikan seluruh proses bot secara aman...")
-                    print("=" * 65 + "\n")
-                    sys.exit(0)
+                print(f"[BLOK I] [TIDAK MATCH] Terdeteksi 'tidak match' (Mode No Meter Aktif). Langsung mengetuk 'Cek Nomor Meter'...")
+                eksekusi_ketuk_cek_nometer(arah_awal="down")
             else:
                 print(f"[BLOK I] [TIDAK MATCH] Terdeteksi 'tidak match' pada swipe ke-{swipe_idx}! Mencari & mengetuk tombol 'Cek ID Pelanggan'...")
                 btn_cek = d(textContains="Cek ID Pelanggan") or d(textContains="CEK ID PELANGGAN") or d(descriptionContains="Cek ID Pelanggan")
@@ -1858,27 +2638,7 @@ def ambil_data_alamat(file_output="temp_alamat.txt", idpel=""):
                 if is_cek_limit:
                     MODE_CEK_NOMETER_AKTIF = True
                     print(f"[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln pada swipe ke-{swipe_idx}! Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan beralih ke 'Cek Nomor Meter'...")
-                    ketuk("Cek Nomor Meter")
-                    print("[BLOK I] [LOADING] Menunggu loading 'Cek Nomor Meter' selesai...")
-                    tunggu_loading(timeout=30)
-                    time.sleep(SLEEP_SHORT)
-                    limit_meter_msg = "Permintaan API check-nometerpln sudah terlampaui (limit)."
-                    try:
-                        xml_after_meter = d.dump_hierarchy().lower()
-                        is_meter_limit = "check-nometerpln sudah terlampaui" in xml_after_meter or (
-                            "terlampaui (limit)" in xml_after_meter and "check-nometer" in xml_after_meter
-                        ) or check_exists(d(textContains=limit_meter_msg))
-                    except Exception:
-                        is_meter_limit = check_exists(d(textContains=limit_meter_msg))
-
-                    if is_meter_limit:
-                        print("\n" + "=" * 65)
-                        print("  [ALERT - KEDUA API TELAH MENCAPAI BATAS LIMIT!]")
-                        print("  Permintaan API 'check-idpln' DAN 'check-nometerpln' sudah limit.")
-                        print("  Server PLN/FASIH saat ini tidak dapat memvalidasi data.")
-                        print("  [OPSI 1] Menghentikan seluruh proses bot secara aman...")
-                        print("=" * 65 + "\n")
-                        sys.exit(0)
+                    eksekusi_ketuk_cek_nometer(arah_awal="down")
                 else:
                     print("[BLOK I] Loading selesai. Melanjutkan swipe & pengambilan data alamat...")
 
@@ -1938,7 +2698,16 @@ def ambil_data_alamat(file_output="temp_alamat.txt", idpel=""):
         for p in patterns:
             el = d(textContains=p)
             if el.exists():
-                txt = el.info.get('text', '').strip()
+                # Elemen bisa hilang (re-render layar) antara exists() dan info; coba ulang dengan aman
+                txt = None
+                for _retry in range(3):
+                    try:
+                        txt = el.info.get('text', '').strip()
+                        break
+                    except Exception:
+                        time.sleep(0.3)
+                if txt is None:
+                    continue
                 if ":" in txt and len(txt) > len(p) + 2:
                     info_alamat[key] = f"{key}: {txt.split(':', 1)[1].strip()}"
                     break
@@ -1953,7 +2722,10 @@ def ambil_data_alamat(file_output="temp_alamat.txt", idpel=""):
                         sibling = el.down(className="android.widget.TextView")
 
                     if sibling.exists():
-                        val = sibling.info.get('text', '').strip()
+                        try:
+                            val = sibling.info.get('text', '').strip()
+                        except Exception:
+                            continue
                         if val and not any(val.startswith(x) for x in ["a. ", "b. ", "c. ", "d. ", "e. "]):
                             info_alamat[key] = f"{key}: {val}"
                             break
@@ -2660,6 +3432,283 @@ def ketuk_ok_submit_diproses(max_attempts=10):
     return True
 
 
+def eksekusi_ketuk_cek_id_pelanggan(arah_awal="down"):
+    """
+    Helper untuk mencari tombol 'Cek ID Pelanggan', memastikan posisi aman di layar,
+    mengetuk tombol tersebut, dan menunggu loading selesai.
+    """
+    global MODE_CEK_NOMETER_AKTIF
+    if MODE_CEK_NOMETER_AKTIF:
+        print("[BLOK I] [BYPASS] Mode Cek Nomor Meter sedang aktif. Mengalihkan langsung ke 'Cek Nomor Meter'...")
+        return eksekusi_ketuk_cek_nometer(arah_awal=arah_awal)
+
+    print("[BLOK I] Men-scroll secara dinamis ke tombol 'Cek ID Pelanggan'...")
+    try:
+        d(scrollable=True).scroll.to(text="Cek ID Pelanggan")
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    d_info = d.info
+    screen_h = d_info.get("displayHeight", 960)
+    screen_w = d_info.get("displayWidth", 540)
+
+    # Pastikan tombol benar-benar terlihat di viewport yang aman (bukan di luar/terpotong navbar)
+    btn_cek = None
+    for swipe_cek in range(1, 10):
+        btn_cek = d(text="Cek ID Pelanggan")
+        if not btn_cek.exists():
+            btn_cek = d(textContains="Cek ID Pelanggan")
+        if not btn_cek.exists():
+            btn_cek = d(descriptionContains="Cek ID Pelanggan")
+
+        if btn_cek.exists():
+            b = btn_cek.info.get("bounds", {})
+            top = b.get("top", 0)
+            bottom = b.get("bottom", 0)
+            # Batas aman: tombol tidak tertutup statusbar atas (top >= 150) dan tidak tertutup navbar bawah (bottom <= screen_h - 120)
+            if 150 <= top and bottom <= (screen_h - 120):
+                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' berada di posisi aman layar (bounds: [{b.get('left')},{top}][{b.get('right')},{bottom}]).")
+                break
+            elif top > (screen_h - 120):
+                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' masih di bawah layar (top={top}, screen_h={screen_h}), swipe ke bawah #{swipe_cek}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.7), screen_w // 2, int(screen_h * 0.4), duration=0.15)
+                time.sleep(0.2)
+            elif bottom < 150:
+                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' terlalu di atas (bottom={bottom}), swipe ke atas #{swipe_cek}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.3), screen_w // 2, int(screen_h * 0.6), duration=0.15)
+                time.sleep(0.2)
+        else:
+            if arah_awal == "up":
+                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' belum terlihat, swipe ke atas #{swipe_cek}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.3), screen_w // 2, int(screen_h * 0.6), duration=0.15)
+            else:
+                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' belum terlihat, swipe ke bawah #{swipe_cek}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.7), screen_w // 2, int(screen_h * 0.4), duration=0.15)
+            time.sleep(0.2)
+
+    # Eksekusi ketuk dengan koordinat tengah (center bounds)
+    sukses_ketuk_cek = False
+    if btn_cek and btn_cek.exists():
+        b = btn_cek.info.get("bounds", {})
+        cx = (b.get("left", 0) + b.get("right", 0)) // 2
+        cy = (b.get("top", 0) + b.get("bottom", 0)) // 2
+        if 0 < cx < screen_w and 0 < cy < screen_h:
+            print(f"[BLOK I] Mengetuk tombol 'Cek ID Pelanggan' pada titik tengah ({cx}, {cy})...")
+            d.click(cx, cy)
+            sukses_ketuk_cek = True
+        else:
+            btn_cek.click()
+            sukses_ketuk_cek = True
+
+    if not sukses_ketuk_cek:
+        print("[BLOK I] Mengetuk tombol 'Cek ID Pelanggan' via ketuk()...")
+        ketuk("Cek ID Pelanggan")
+
+    print("[BLOK I] [LOADING] Menunggu loading 'Cek ID Pelanggan' selesai...")
+    tunggu_loading(timeout=30)
+    time.sleep(SLEEP_SHORT)
+
+    # Pemeriksaan Limit API check-idpln -> Jika terlampaui/limit, beralih mengetuk tombol Nomor Meter
+    limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
+    is_limit_cek = False
+    try:
+        xml_after = d.dump_hierarchy().lower()
+        if "check-idpln sudah terlampaui" in xml_after or "terlampaui (limit)" in xml_after or check_exists(d(textContains=limit_msg)):
+            is_limit_cek = True
+    except Exception:
+        is_limit_cek = check_exists(d(textContains=limit_msg))
+
+    if is_limit_cek:
+        MODE_CEK_NOMETER_AKTIF = True
+        print("[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln! Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan beralih ke 'Cek Nomor Meter'...")
+        eksekusi_ketuk_cek_nometer(arah_awal="down")
+        return
+
+    # Scan apakah muncul teks mengandung "Rincian 101a" atau "Rincian 101b" (tidak sama dengan hasil Cek ID Pelanggan)
+    max_retry_rincian = 10
+    for try_rincian in range(1, max_retry_rincian + 1):
+        try:
+            xml_cur = d.dump_hierarchy().lower()
+        except Exception:
+            xml_cur = ""
+
+        ada_rincian_101 = (
+            "rincian 101a" in xml_cur or
+            "rincian 101b" in xml_cur or
+            check_exists(d(textContains="Rincian 101a")) or
+            check_exists(d(textContains="Rincian 101b")) or
+            check_exists(d(descriptionContains="Rincian 101a")) or
+            check_exists(d(descriptionContains="Rincian 101b")) or
+            check_exists(d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101a') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101a') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b')]"))
+        )
+
+        if "check-idpln sudah terlampaui" in xml_cur or "terlampaui (limit)" in xml_cur or check_exists(d(textContains=limit_msg)):
+            MODE_CEK_NOMETER_AKTIF = True
+            print("[BLOK I] [LIMIT DETECTED] API check-idpln limit terdeteksi saat pengecekan rincian. Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan beralih ke 'Cek Nomor Meter'...")
+            eksekusi_ketuk_cek_nometer(arah_awal="down")
+            break
+
+        if not ada_rincian_101:
+            if try_rincian > 1:
+                print(f"[BLOK I] [SUKSES] Pesan 'Rincian 101a / 101b' sudah hilang setelah {try_rincian - 1}x ketuk ulang. Melanjutkan proses...")
+            break
+
+        terdeteksi_list = []
+        if "rincian 101a" in xml_cur or check_exists(d(textContains="Rincian 101a")):
+            terdeteksi_list.append("Rincian 101a")
+        if "rincian 101b" in xml_cur or check_exists(d(textContains="Rincian 101b")):
+            terdeteksi_list.append("Rincian 101b")
+        nama_rincian = " & ".join(terdeteksi_list) if terdeteksi_list else "Rincian 101a/101b"
+
+        print(f"[BLOK I] [WARNING] Terdeteksi pesan mengandung '{nama_rincian} tidak sama dengan hasil Cek ID Pelanggan' (pemeriksaan ke-{try_rincian}/{max_retry_rincian}). Mengetuk kembali 'Cek ID Pelanggan'...")
+
+        # Cari dan pastikan tombol 'Cek ID Pelanggan' dapat diketuk
+        btn_cek_rincian = d(className="android.widget.Button", text="Cek ID Pelanggan")
+        if not check_exists(btn_cek_rincian):
+            btn_cek_rincian = d(text="Cek ID Pelanggan")
+        if not check_exists(btn_cek_rincian):
+            btn_cek_rincian = d(textContains="Cek ID Pelanggan")
+        if not check_exists(btn_cek_rincian):
+            btn_cek_rincian = d(descriptionContains="Cek ID Pelanggan")
+
+        if not check_exists(btn_cek_rincian):
+            try:
+                d(scrollable=True).scroll.to(text="Cek ID Pelanggan")
+                time.sleep(0.3)
+            except Exception:
+                pass
+            btn_cek_rincian = d(className="android.widget.Button", text="Cek ID Pelanggan") or d(text="Cek ID Pelanggan")
+
+        sukses_ketuk_rincian = False
+        if check_exists(btn_cek_rincian):
+            try:
+                b = btn_cek_rincian.info.get("bounds", {})
+                cx = (b.get("left", 0) + b.get("right", 0)) // 2
+                cy = (b.get("top", 0) + b.get("bottom", 0)) // 2
+                if 0 < cx < screen_w and 0 < cy < screen_h:
+                    print(f"[BLOK I] Mengetuk tombol 'Cek ID Pelanggan' pada ({cx}, {cy})...")
+                    d.click(cx, cy)
+                    sukses_ketuk_rincian = True
+                else:
+                    btn_cek_rincian.click()
+                    sukses_ketuk_rincian = True
+            except Exception:
+                pass
+
+        if not sukses_ketuk_rincian:
+            ketuk("Cek ID Pelanggan")
+
+        time.sleep(0.5)
+        print("[BLOK I] [LOADING] Menunggu loading 'Cek ID Pelanggan' selesai...")
+        tunggu_loading(timeout=30)
+        time.sleep(SLEEP_SHORT)
+
+
+def eksekusi_ketuk_cek_nometer(arah_awal="down"):
+    """
+    Helper untuk mencari tombol 'Cek Nomor Meter' secara dinamis,
+    memastikan posisi aman di layar, mengetuk tombol tersebut,
+    dan menunggu loading selesai.
+    """
+    print("[BLOK I] Men-scroll secara dinamis ke tombol 'Cek Nomor Meter'...")
+    try:
+        d(scrollable=True).scroll.to(text="Cek Nomor Meter")
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    d_info = d.info
+    screen_h = d_info.get("displayHeight", 960)
+    screen_w = d_info.get("displayWidth", 540)
+
+    btn_meter = None
+    max_swipes_meter = 15
+
+    for swipe_idx in range(1, max_swipes_meter + 1):
+        btn_meter = d(text="Cek Nomor Meter")
+        if not check_exists(btn_meter):
+            btn_meter = d(textContains="Cek Nomor Meter")
+        if not check_exists(btn_meter):
+            btn_meter = d(textContains="Cek No Meter")
+        if not check_exists(btn_meter):
+            btn_meter = d(descriptionContains="Cek Nomor Meter")
+        if not check_exists(btn_meter):
+            btn_meter = d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'cek nomor meter') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'cek nomor meter') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'cek no meter')]")
+
+        if check_exists(btn_meter):
+            b = btn_meter.info.get("bounds", {})
+            top = b.get("top", 0)
+            bottom = b.get("bottom", 0)
+            if 150 <= top and bottom <= (screen_h - 120):
+                print(f"[BLOK I] Tombol 'Cek Nomor Meter' berada di posisi aman layar (bounds: [{b.get('left')},{top}][{b.get('right')},{bottom}]).")
+                break
+            elif top > (screen_h - 120):
+                print(f"[BLOK I] Tombol 'Cek Nomor Meter' masih di bawah layar (top={top}), swipe ke bawah #{swipe_idx}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.7), screen_w // 2, int(screen_h * 0.4), duration=0.15)
+                time.sleep(0.2)
+            elif bottom < 150:
+                print(f"[BLOK I] Tombol 'Cek Nomor Meter' terlalu di atas (bottom={bottom}), swipe ke atas #{swipe_idx}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.3), screen_w // 2, int(screen_h * 0.6), duration=0.15)
+                time.sleep(0.2)
+        else:
+            if arah_awal == "up":
+                print(f"[BLOK I] Tombol 'Cek Nomor Meter' belum terlihat, swipe ke atas #{swipe_idx}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.3), screen_w // 2, int(screen_h * 0.6), duration=0.15)
+            else:
+                print(f"[BLOK I] Tombol 'Cek Nomor Meter' belum terlihat, swipe ke bawah #{swipe_idx}...")
+                swipe_aman(screen_w // 2, int(screen_h * 0.7), screen_w // 2, int(screen_h * 0.4), duration=0.15)
+            time.sleep(0.2)
+
+    # Eksekusi ketuk dengan koordinat tengah (center bounds)
+    sukses_ketuk_meter = False
+    if btn_meter and check_exists(btn_meter):
+        try:
+            b = btn_meter.info.get("bounds", {})
+            cx = (b.get("left", 0) + b.get("right", 0)) // 2
+            cy = (b.get("top", 0) + b.get("bottom", 0)) // 2
+            if 0 < cx < screen_w and 0 < cy < screen_h:
+                print(f"[BLOK I] Mengetuk tombol 'Cek Nomor Meter' pada titik tengah ({cx}, {cy})...")
+                d.click(cx, cy)
+                sukses_ketuk_meter = True
+            else:
+                btn_meter.click()
+                sukses_ketuk_meter = True
+        except Exception as e:
+            print(f"[BLOK I] [WARNING] Gagal klik koordinat 'Cek Nomor Meter': {e}")
+
+    if not sukses_ketuk_meter:
+        print("[BLOK I] Mengetuk tombol 'Cek Nomor Meter' via ketuk()...")
+        ketuk("Cek Nomor Meter")
+
+    print("[BLOK I] [LOADING] Menunggu loading 'Cek Nomor Meter' selesai...")
+    tunggu_loading(timeout=30)
+    time.sleep(SLEEP_SHORT)
+
+    # Pemeriksaan apakah API check-nometerpln juga limit (Kondisi Kedua API Limit - Opsi 1)
+    limit_meter_msg = "Permintaan API check-nometerpln sudah terlampaui (limit)."
+    is_meter_limit = False
+    try:
+        xml_after_meter = d.dump_hierarchy().lower()
+        if "check-nometerpln sudah terlampaui" in xml_after_meter or (
+            "terlampaui (limit)" in xml_after_meter and "check-nometer" in xml_after_meter
+        ) or check_exists(d(textContains=limit_meter_msg)):
+            is_meter_limit = True
+    except Exception:
+        is_meter_limit = check_exists(d(textContains=limit_meter_msg))
+
+    if is_meter_limit:
+        print("\n" + "=" * 65)
+        print("  [ALERT - KEDUA API TELAH MENCAPAI BATAS LIMIT!]")
+        print("  Permintaan API 'check-idpln' DAN 'check-nometerpln' sudah limit.")
+        print("  Server PLN/FASIH saat ini tidak dapat memvalidasi data.")
+        print("  [OPSI 1] Menghentikan seluruh proses bot secara aman...")
+        print("=" * 65 + "\n")
+        sys.exit(0)
+
+    return True
+
+
 
 def proses_update_reject_nik():
     """Fungsi utama memproses list data reject untuk update NIK"""
@@ -2825,26 +3874,56 @@ def proses_update_reject_nik():
             ketuk("Kirim", sleep_after=SLEEP_SHORT)
             time.sleep(SLEEP_SHORT)
 
-            # Ketuk teks yang mengandung kata "GALAT"
+            # Ketuk teks yang mengandung kata "GALAT" dengan verifikasi tombol "Lihat" (retry max 3x)
             print("[VALIDASI AWAL] Mengetuk 'GALAT' pada modal validasi...")
-            ketuk("GALAT", exact=False, sleep_after=SLEEP_SHORT)
+            ketuk_tab_galat_dengan_verifikasi(max_retry=3)
             time.sleep(SLEEP_SHORT)
 
-            # Cek apakah ada kata yang mengandung "Nomor Meter" atau "ID pelanggan PLN"
-            try:
-                xml_galat = d.dump_hierarchy().lower()
-            except Exception:
-                xml_galat = ""
+            # Cek apakah ada kata yang mengandung "Nomor Meter" atau "ID pelanggan PLN" (dengan retry max 3x dan variasi kata kunci)
+            print(f"[GALAT CHECK] Memeriksa keberadaan galat 'Nomor Meter' / 'ID pelanggan PLN' untuk IDPEL {idpel} (max 3x percobaan)...")
+            is_nomor_meter_galat = False
+            detected_keyword = ""
 
-            is_nomor_meter_galat = (
-                "nomor meter" in xml_galat or 
-                "id pelanggan pln" in xml_galat or
-                check_exists(d(textContains="Nomor Meter")) or
-                check_exists(d(textContains="ID pelanggan PLN"))
-            )
+            for check_attempt in range(1, 4):
+                try:
+                    xml_galat = d.dump_hierarchy().lower()
+                except Exception:
+                    xml_galat = ""
+
+                # Daftar kata kunci variasi yang menandakan error Nomor Meter / ID Pelanggan
+                keywords = [
+                    "nomor meter", "no meter", "nometer", "meteran",
+                    "id pelanggan pln", "id pelanggan", "idpel",
+                    "101a", "101b", "rincian 101", "tidak sama"
+                ]
+
+                for kw in keywords:
+                    if kw in xml_galat:
+                        is_nomor_meter_galat = True
+                        detected_keyword = kw
+                        break
+
+                if not is_nomor_meter_galat:
+                    if (check_exists(d(textContains="Nomor Meter")) or
+                        check_exists(d(textContains="ID pelanggan PLN")) or
+                        check_exists(d(textContains="ID Pelanggan")) or
+                        check_exists(d(textContains="101a")) or
+                        check_exists(d(textContains="101b")) or
+                        check_exists(d(descriptionContains="Nomor Meter")) or
+                        check_exists(d(descriptionContains="ID Pelanggan")) or
+                        check_exists(d.xpath("//*[contains(@text, '101a') or contains(@text, '101b') or contains(@content-desc, '101a') or contains(@content-desc, '101b')]"))):
+                        is_nomor_meter_galat = True
+                        detected_keyword = "selector/xpath match"
+
+                if is_nomor_meter_galat:
+                    print(f"[GALAT CHECK] [TRUE] Terdeteksi galat '{detected_keyword}' pada percobaan ke-{check_attempt} untuk IDPEL {idpel}!")
+                    break
+                else:
+                    if check_attempt < 3:
+                        print(f"[GALAT CHECK] [RETRY] Percobaan {check_attempt}/3 belum mendeteksi teks galat. Menunggu 0.5s...")
+                        time.sleep(0.5)
 
             if is_nomor_meter_galat:
-                print(f"[GALAT CHECK] [TRUE] Terdeteksi galat 'Nomor Meter' / 'ID pelanggan PLN' untuk IDPEL {idpel}!")
                 print("[DISMISS] Mengetuk tombol 'Dismiss' pertama (modal Galat)...")
                 ketuk("Dismiss", sleep_after=SLEEP_SHORT)
                 time.sleep(SLEEP_SHORT)
@@ -2852,136 +3931,120 @@ def proses_update_reject_nik():
                 ketuk("Dismiss", sleep_after=SLEEP_SHORT)
                 time.sleep(SLEEP_SHORT)
 
+                # Cek apakah mode Cek Nomor Meter sudah aktif permanen untuk sesi ini
                 if MODE_CEK_NOMETER_AKTIF:
-                    print(f"[BLOK I] [MODE NOMETER AKTIF] IDPEL {idpel}: Mode Cek Nomor Meter sedang aktif. Mengetuk tombol 'Cek Nomor Meter'...")
-                    ketuk("Cek Nomor Meter")
-                    print("[BLOK I] [LOADING] Menunggu loading 'Cek Nomor Meter' selesai...")
-                    tunggu_loading(timeout=30)
-                    time.sleep(SLEEP_SHORT)
-                    # Pemeriksaan apakah API check-nometerpln juga limit (Kondisi Kedua API Limit - Opsi 1)
-                    limit_meter_msg = "Permintaan API check-nometerpln sudah terlampaui (limit)."
-                    try:
-                        xml_after_meter = d.dump_hierarchy().lower()
-                        is_meter_limit = "check-nometerpln sudah terlampaui" in xml_after_meter or (
-                            "terlampaui (limit)" in xml_after_meter and "check-nometer" in xml_after_meter
-                        ) or check_exists(d(textContains=limit_meter_msg))
-                    except Exception:
-                        is_meter_limit = check_exists(d(textContains=limit_meter_msg))
-
-                    if is_meter_limit:
-                        print("\n" + "=" * 65)
-                        print("  [ALERT - KEDUA API TELAH MENCAPAI BATAS LIMIT!]")
-                        print("  Permintaan API 'check-idpln' DAN 'check-nometerpln' sudah limit.")
-                        print("  Server PLN/FASIH saat ini tidak dapat memvalidasi data.")
-                        print("  [OPSI 1] Menghentikan seluruh proses bot secara aman...")
-                        print("=" * 65 + "\n")
-                        sys.exit(0)
+                    print(f"[BLOK I] [MODE NOMETER AKTIF] IDPEL {idpel}: Langsung mencari & mengeksekusi 'Cek Nomor Meter'...")
+                    eksekusi_ketuk_cek_nometer(arah_awal="down")
                 else:
                     # Scroll ke bawah sampai ketemu "Cek ID Pelanggan" dan ketuk tombolnya
-                    print("[BLOK I] Men-scroll secara dinamis ke tombol 'Cek ID Pelanggan'...")
-                    try:
-                        d(scrollable=True).scroll.to(text="Cek ID Pelanggan")
-                        time.sleep(0.3)
-                    except Exception:
-                        pass
-
-                    d_info = d.info
-                    screen_h = d_info.get("displayHeight", 960)
-                    screen_w = d_info.get("displayWidth", 540)
-
-                    # Pastikan tombol benar-benar terlihat di viewport yang aman (bukan di luar/terpotong navbar)
-                    btn_cek = None
-                    for swipe_cek in range(1, 10):
-                        btn_cek = d(text="Cek ID Pelanggan")
-                        if not btn_cek.exists():
-                            btn_cek = d(textContains="Cek ID Pelanggan")
-                        if not btn_cek.exists():
-                            btn_cek = d(descriptionContains="Cek ID Pelanggan")
-
-                        if btn_cek.exists():
-                            b = btn_cek.info.get("bounds", {})
-                            top = b.get("top", 0)
-                            bottom = b.get("bottom", 0)
-                            # Batas aman: tombol tidak tertutup statusbar atas (top >= 150) dan tidak tertutup navbar bawah (bottom <= screen_h - 120)
-                            if 150 <= top and bottom <= (screen_h - 120):
-                                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' berada di posisi aman layar (bounds: [{b.get('left')},{top}][{b.get('right')},{bottom}]).")
-                                break
-                            elif top > (screen_h - 120):
-                                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' masih di bawah layar (top={top}, screen_h={screen_h}), swipe ke bawah #{swipe_cek}...")
-                                swipe_aman(screen_w // 2, int(screen_h * 0.7), screen_w // 2, int(screen_h * 0.4), duration=0.15)
-                                time.sleep(0.2)
-                            elif bottom < 150:
-                                print(f"[BLOK I] Tombol 'Cek ID Pelanggan' terlalu di atas (bottom={bottom}), swipe ke atas #{swipe_cek}...")
-                                swipe_aman(screen_w // 2, int(screen_h * 0.3), screen_w // 2, int(screen_h * 0.6), duration=0.15)
-                                time.sleep(0.2)
-                        else:
-                            print(f"[BLOK I] Tombol 'Cek ID Pelanggan' belum terlihat, swipe ke bawah #{swipe_cek}...")
-                            swipe_aman(screen_w // 2, int(screen_h * 0.7), screen_w // 2, int(screen_h * 0.4), duration=0.15)
-                            time.sleep(0.2)
-
-                    # Eksekusi ketuk dengan koordinat tengah (center bounds)
-                    sukses_ketuk_cek = False
-                    if btn_cek and btn_cek.exists():
-                        b = btn_cek.info.get("bounds", {})
-                        cx = (b.get("left", 0) + b.get("right", 0)) // 2
-                        cy = (b.get("top", 0) + b.get("bottom", 0)) // 2
-                        if 0 < cx < screen_w and 0 < cy < screen_h:
-                            print(f"[BLOK I] Mengetuk tombol 'Cek ID Pelanggan' pada titik tengah ({cx}, {cy})...")
-                            d.click(cx, cy)
-                            sukses_ketuk_cek = True
-                        else:
-                            btn_cek.click()
-                            sukses_ketuk_cek = True
-                    
-                    if not sukses_ketuk_cek:
-                        print("[BLOK I] Mengetuk tombol 'Cek ID Pelanggan' via ketuk()...")
-                        ketuk("Cek ID Pelanggan")
-
-                    print("[BLOK I] [LOADING] Menunggu loading 'Cek ID Pelanggan' selesai...")
-                    tunggu_loading(timeout=30)
-                    time.sleep(SLEEP_SHORT)
-
-                    # Pemeriksaan Limit API check-idpln -> Jika terlampaui/limit, beralih mengetuk tombol Nomor Meter
-                    limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
-                    try:
-                        xml_after = d.dump_hierarchy().lower()
-                        is_limit_cek = "check-idpln sudah terlampaui" in xml_after or "terlampaui (limit)" in xml_after or check_exists(d(textContains=limit_msg))
-                    except Exception:
-                        is_limit_cek = check_exists(d(textContains=limit_msg))
-
-                    if is_limit_cek:
-                        MODE_CEK_NOMETER_AKTIF = True
-                        print("[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln! Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan beralih ke 'Cek Nomor Meter'...")
-                        ketuk("Cek Nomor Meter")
-                        print("[BLOK I] [LOADING] Menunggu loading 'Cek Nomor Meter' selesai...")
-                        tunggu_loading(timeout=30)
-                        time.sleep(SLEEP_SHORT)
-                        # Pemeriksaan apakah API check-nometerpln juga limit (Kondisi Kedua API Limit - Opsi 1)
-                        limit_meter_msg = "Permintaan API check-nometerpln sudah terlampaui (limit)."
-                        try:
-                            xml_after_meter = d.dump_hierarchy().lower()
-                            is_meter_limit = "check-nometerpln sudah terlampaui" in xml_after_meter or (
-                                "terlampaui (limit)" in xml_after_meter and "check-nometer" in xml_after_meter
-                            ) or check_exists(d(textContains=limit_meter_msg))
-                        except Exception:
-                            is_meter_limit = check_exists(d(textContains=limit_meter_msg))
-
-                        if is_meter_limit:
-                            print("\n" + "=" * 65)
-                            print("  [ALERT - KEDUA API TELAH MENCAPAI BATAS LIMIT!]")
-                            print("  Permintaan API 'check-idpln' DAN 'check-nometerpln' sudah limit.")
-                            print("  Server PLN/FASIH saat ini tidak dapat memvalidasi data.")
-                            print("  [OPSI 1] Menghentikan seluruh proses bot secara aman...")
-                            print("=" * 65 + "\n")
-                            sys.exit(0)
+                    eksekusi_ketuk_cek_id_pelanggan(arah_awal="down")
             else:
-                print("[GALAT CHECK] [FALSE] Tidak terdeteksi kata 'Nomor Meter' / 'ID pelanggan PLN'. Menutup modal...")
+                print("[GALAT CHECK] [FALSE] Tidak terdeteksi kata 'Nomor Meter' / 'ID pelanggan PLN' setelah 3x pengecekan. Menutup modal...")
                 print("[DISMISS] Mengetuk tombol 'Dismiss' pertama (modal Galat)...")
                 ketuk("Dismiss", sleep_after=SLEEP_SHORT)
                 time.sleep(SLEEP_SHORT)
                 print("[DISMISS] Mengetuk tombol 'Dismiss' kedua (modal Kirim)...")
                 ketuk("Dismiss", sleep_after=SLEEP_SHORT)
                 time.sleep(SLEEP_SHORT)
+
+                # Performing dynamic swipe sampai ketemu tombol "cek nomor meter"
+                print("[BLOK I] Memulai scan & dynamic swipe mencari tombol 'Cek Nomor Meter'...")
+                d_info = d.info
+                screen_h = d_info.get("displayHeight", 960)
+                screen_w = d_info.get("displayWidth", 540)
+                max_swipes_meter = 15
+                btn_meter_found = False
+
+                for swipe_idx in range(1, max_swipes_meter + 1):
+                    # Cek apakah tombol Cek Nomor Meter sudah terlihat di layar
+                    btn_meter = d(text="Cek Nomor Meter")
+                    if not btn_meter.exists():
+                        btn_meter = d(textContains="Cek Nomor Meter")
+                    if not btn_meter.exists():
+                        btn_meter = d(descriptionContains="Cek Nomor Meter")
+                    if not btn_meter.exists():
+                        btn_meter = d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'cek nomor meter') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'cek nomor meter')]")
+
+                    if check_exists(btn_meter):
+                        print(f"[BLOK I] [SUKSES] Tombol 'Cek Nomor Meter' ditemukan di layar (pemeriksaan ke-{swipe_idx}).")
+                        btn_meter_found = True
+                        break
+
+                    # Jika belum ditemukan, lakukan dynamic swipe ke bawah
+                    print(f"[BLOK I] Performing dynamic swipe {swipe_idx} (540, 800 -> 540, 155)...")
+                    try:
+                        swipe_aman(screen_w // 2, int(screen_h * 0.7), screen_w // 2, int(screen_h * 0.4), duration=0.15)
+                        time.sleep(0.3)
+                    except Exception as e:
+                        print(f"[BLOK I] [WARNING] Gagal swipe: {e}")
+                        break
+
+                # Scan halaman: memverifikasi galat Nomor Meter (101b) vs ID Pelanggan (101a)
+                print("[BLOK I] Memeriksa keberadaan galat Nomor Meter (101b) pada halaman...")
+                try:
+                    xml_page = d.dump_hierarchy().lower()
+                except Exception:
+                    xml_page = ""
+
+                # 1. Cek Galat Nomor Meter (101b)
+                is_galat_101b = (
+                    "101b. nomor meter" in xml_page or
+                    "rincian 101b tidak sama dengan hasil cek nomor meter" in xml_page or
+                    "rincian 101b tidak sama" in xml_page or
+                    "101b tidak sama" in xml_page or
+                    check_exists(d(textContains="101b. Nomor Meter")) or
+                    check_exists(d(textContains="101b. Nomor meter")) or
+                    check_exists(d(textContains="Rincian 101b tidak sama dengan hasil Cek Nomor meter")) or
+                    check_exists(d(textContains="Rincian 101b tidak sama")) or
+                    check_exists(d(descriptionContains="101b. Nomor Meter")) or
+                    check_exists(d(descriptionContains="101b. Nomor meter")) or
+                    check_exists(d(descriptionContains="Rincian 101b tidak sama dengan hasil Cek Nomor meter")) or
+                    check_exists(d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '101b. nomor meter') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b tidak sama') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '101b. nomor meter') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b tidak sama')]"))
+                )
+
+                if is_galat_101b:
+                    print("[BLOK I] [MATCH] Terdeteksi galat Nomor Meter (101b)! Mengetuk tombol 'Cek Nomor Meter'...")
+                    eksekusi_ketuk_cek_nometer(arah_awal="down")
+                    time.sleep(SLEEP_SHORT)
+                else:
+                    # 2. Cek apakah ada ketidakcocokan ID Pelanggan (101a / teks 'tidak sama')
+                    is_mismatch_101a = (
+                        "tidak sama" in xml_page or
+                        "rincian 101a" in xml_page or
+                        check_exists(d(textContains="tidak sama")) or
+                        check_exists(d(textContains="Rincian 101a")) or
+                        check_exists(d(descriptionContains="tidak sama")) or
+                        check_exists(d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tidak sama') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'tidak sama')]"))
+                    )
+
+                    if is_mismatch_101a:
+                        if MODE_CEK_NOMETER_AKTIF:
+                            print("[BLOK I] [MODE NOMETER AKTIF] Terdeteksi teks 'tidak sama' (ID Pelanggan), dialihkan langsung ke 'Cek Nomor Meter'...")
+                            eksekusi_ketuk_cek_nometer(arah_awal="down")
+                        else:
+                            print("[BLOK I] [MATCH] Terdeteksi teks 'tidak sama' (ID Pelanggan)! Mengetuk tombol 'Cek ID Pelanggan'...")
+                            eksekusi_ketuk_cek_id_pelanggan(arah_awal="up")
+                    else:
+                        print("[BLOK I] Tidak terdeteksi galat Nomor Meter maupun ID Pelanggan. Melanjutkan ke data alamat...")
+
+            # Scan sebelum ambil_data_alamat(): apakah muncul limit API check-idpln setelah loading Cek ID Pelanggan
+            limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
+            is_limit_api_idpel = False
+            try:
+                xml_before_alamat = d.dump_hierarchy().lower()
+                if "check-idpln sudah terlampaui" in xml_before_alamat or "terlampaui (limit)" in xml_before_alamat:
+                    is_limit_api_idpel = True
+                elif check_exists(d(textContains=limit_msg)) or check_exists(d(textContains="terlampaui (limit)")):
+                    is_limit_api_idpel = True
+            except Exception:
+                is_limit_api_idpel = check_exists(d(textContains=limit_msg))
+
+            if is_limit_api_idpel:
+                MODE_CEK_NOMETER_AKTIF = True
+                print(f"[BLOK I] [LIMIT DETECTED] Muncul teks '{limit_msg}' sebelum ambil data alamat!")
+                print("[BLOK I] Mengaktifkan MODE_CEK_NOMETER_AKTIF = True dan men-scroll dinamis mencari & mengetuk tombol 'Cek Nomor Meter'...")
+                eksekusi_ketuk_cek_nometer(arah_awal="down")
+
             alamat_dict = ambil_data_alamat(file_output="temp_alamat.txt", idpel=idpel)
             time.sleep(SLEEP_SHORT)
 
@@ -3182,6 +4245,9 @@ def proses_update_reject_nik():
 
             if is_galat_0 and is_kosong_0:
                 print(f"[KIRIM CHECK] [SUKSES BERSIH] Terdeteksi 'GALAT 0' dan 'KOSONG 0' pada modal Kirim pertama! Memproses submit & selesai...")
+                if not pause_proses_galat_0(idpel=idpel, row=row, keterangan="Cek Form Awal"):
+                    print(f"[HALT] Seluruh proses bot dihentikan secara manual oleh pengguna pada baris {row} (IDPEL: {idpel}).")
+                    return
                 res_submit = eksekusi_submit_dan_selesai(row, idpel, row_attempt)
                 if res_submit == "retry":
                     continue
@@ -3189,8 +4255,8 @@ def proses_update_reject_nik():
                     sukses_baris = True
                     break
 
-            # Ketuk teks yang mengandung kata "GALAT"
-            ketuk("GALAT", exact=False, sleep_after=SLEEP_SHORT)
+            # Ketuk teks yang mengandung kata "GALAT" dengan verifikasi tombol "Lihat" (retry max 3x)
+            ketuk_tab_galat_dengan_verifikasi(max_retry=3)
             time.sleep(SLEEP_SHORT)
 
             # Cek jika muncul kata "Koordinat lokasi meteran" atau "Foto rumah tampak depan"
@@ -3209,11 +4275,20 @@ def proses_update_reject_nik():
                 pass
 
             if is_galat_koordinat_foto:
-                print(f"[GALAT CHECK] [SKIP] Terdeteksi 'Koordinat lokasi meteran' / 'Foto rumah tampak depan' pada GALAT untuk IDPEL {idpel}. Menyimpan status & berpindah ke baris berikutnya...")
-                simpan_status_excel(row, "koordinat & foto tidak ada")
-                kembali_ke_daftar_assignment()
-                sukses_baris = True
-                break
+                print(f"[GALAT CHECK] Terdeteksi 'Koordinat lokasi meteran' / 'Foto rumah tampak depan' pada GALAT untuk IDPEL {idpel}. Mencoba perbaikan otomatis...")
+
+                # Ketuk Lihat → perbaiki error 105/106 secara otomatis
+                fix_berhasil = perbaiki_galat_koordinat_foto(skip_ketuk_galat=True)
+
+                if fix_berhasil:
+                    print("[GALAT FIX] Perbaikan berhasil pada validasi awal. Melanjutkan ke BLOK II, III, dan IV (re-submit dilakukan setelah mengisi catatan di Blok IV)...")
+                else:
+                    # Perbaikan gagal → fallback skip
+                    print(f"[GALAT CHECK] [SKIP] Perbaikan otomatis gagal untuk IDPEL {idpel}. Menyimpan status & berpindah ke baris berikutnya...")
+                    simpan_status_excel(row, "koordinat & foto tidak ada")
+                    kembali_ke_daftar_assignment()
+                    sukses_baris = True
+                    break
             else:
                 print("[DISMISS] Mengetuk tombol 'Dismiss' pertama (modal Galat)...")
                 ketuk("Dismiss", sleep_after=SLEEP_SHORT)
@@ -3273,9 +4348,10 @@ def proses_update_reject_nik():
             if not nama_terisi_sukses:
                 print(f"[SCAN NAMA] [ERROR] Field '201. Nama penghuni' tetap gagal terisi setelah {max_nama_attempts}x percobaan.")
 
-            # Pengisian '202. NIK penghuni' dan 'Cek NIK' dengan verifikasi scan halaman untuk 'NIK tidak valid'
+            # Pengisian '202. NIK penghuni' dan 'Cek NIK' dengan verifikasi scan halaman untuk 'NIK tidak valid' dan 'NIK TIDAK DITEMUKAN'
             max_nik_attempts = 5
             nik_sukses = False
+            nik_tidak_ditemukan = False
 
             # Cek terlebih dahulu apakah field NIK berisi nilai dummy '9999999999999998'
             nik_existing = baca_nilai_field_nik(d)
@@ -3327,6 +4403,16 @@ def proses_update_reject_nik():
                 ketuk("Cek NIK")
                 tunggu_loading_cek_nik(timeout=30, sleep_before=0.3)
 
+                # Pengecekan 1: Scan apakah muncul 'NIK TIDAK DITEMUKAN'
+                is_nik_not_found, msg_not_found = cek_nik_tidak_ditemukan(d)
+                if is_nik_not_found:
+                    print(f"[SCAN NIK] [SKIP] Terdeteksi pesan '{msg_not_found}'. Menyimpan status Excel 'Error Nik tidak ditemukan' & melompati IDPEL {idpel}...")
+                    simpan_status_excel(row, "Error Nik tidak ditemukan")
+                    kembali_ke_daftar_assignment()
+                    nik_tidak_ditemukan = True
+                    break
+
+                # Pengecekan 2: Scan apakah muncul 'NIK tidak valid'
                 is_nik_invalid, msg_error = cek_nik_tidak_valid(d)
                 if is_nik_invalid:
                     print(f"[SCAN NIK] [RETRY NIK] Terdeteksi '{msg_error}' (percobaan ke-{nik_attempt}/{max_nik_attempts}). Melakukan swipe ke bawah & ke atas...")
@@ -3339,12 +4425,107 @@ def proses_update_reject_nik():
                     nik_sukses = True
                     break
 
+            # Jika NIK tidak ditemukan, langsung skip IDPEL ini dan lanjut ke IDPEL berikutnya
+            if nik_tidak_ditemukan:
+                sukses_baris = True
+                break
+
             if not nik_sukses:
                 print(f"[SCAN NIK] [GAGAL] NIK '{nik}' tetap 'NIK tidak valid' setelah {max_nik_attempts}x percobaan. Menyimpan status Excel & berpindah ke baris berikutnya...")
                 simpan_status_excel(row, "Error : Nik tidak valid")
                 kembali_ke_daftar_assignment()
                 sukses_baris = True
                 break
+
+            # --- PENGECEKAN GALAT 0 SETELAH CEK NIK ---
+            print(f"\n[CEK NIK -> VALIDASI] Memeriksa status 'GALAT 0' setelah Cek NIK untuk IDPEL {idpel}...")
+            is_galat_0_nik = (
+                check_exists(d(textContains="GALAT 0 Perlu diperbaiki")) or 
+                check_exists(d(textContains="GALAT 0")) or 
+                check_exists(d(descriptionContains="GALAT 0")) or 
+                check_exists(d.xpath("//*[contains(@text, 'GALAT 0') or contains(@content-desc, 'GALAT 0')]"))
+            )
+
+            modal_validasi_terbuka = False
+            if not is_galat_0_nik:
+                # Buka modal ringkasan validasi dengan mengetuk 'Kirim' pada toolbar atas
+                print("[CEK NIK -> VALIDASI] Mengetuk tombol 'Kirim' toolbar untuk memverifikasi ringkasan validasi (GALAT 0)...")
+                kirim_clicked = False
+
+                btn_kirim = d(className="android.widget.Button", text="Kirim")
+                if not btn_kirim.exists():
+                    btn_kirim = d(text="Kirim", clickable=True)
+                if not btn_kirim.exists():
+                    btn_kirim = d(text="Kirim")
+
+                if check_exists(btn_kirim):
+                    try:
+                        info = btn_kirim.info
+                        b = info.get("bounds") if isinstance(info, dict) else None
+                        if b and isinstance(b, dict):
+                            cx = (b.get("left", 0) + b.get("right", 0)) // 2
+                            cy = (b.get("top", 0) + b.get("bottom", 0)) // 2
+                            if cx > 0 and cy > 0:
+                                print(f"[CEK NIK -> VALIDASI] Mengetuk tombol 'Kirim' toolbar pada ({cx}, {cy})...")
+                                d.click(cx, cy)
+                                kirim_clicked = True
+                    except Exception:
+                        pass
+
+                if not kirim_clicked:
+                    print("[CEK NIK -> VALIDASI] Mengetuk tombol 'Kirim' toolbar via ketuk()...")
+                    kirim_clicked = ketuk("Kirim", sleep_after=SLEEP_SHORT)
+
+                if not kirim_clicked:
+                    print("[CEK NIK -> VALIDASI] Fallback mengetuk koordinat toolbar atas (894, 162)...")
+                    d.click(894, 162)
+
+                time.sleep(SLEEP_SHORT)
+
+                # Ketuk YA jika muncul dialog konfirmasi pengiriman
+                if check_exists(d(text="YA")) or check_exists(d(textContains="YA")):
+                    ketuk("YA", sleep_after=SLEEP_SHORT)
+                    time.sleep(SLEEP_SHORT)
+
+                # Tunggu dan periksa apakah modal ringkasan validasi menampilkan 'GALAT 0'
+                for _ in range(12):
+                    if (check_exists(d(textContains="GALAT 0 Perlu diperbaiki")) or 
+                        check_exists(d(textContains="GALAT 0")) or 
+                        check_exists(d(descriptionContains="GALAT 0")) or 
+                        check_exists(d.xpath("//*[contains(@text, 'GALAT 0') or contains(@content-desc, 'GALAT 0')]"))):
+                        is_galat_0_nik = True
+                        modal_validasi_terbuka = True
+                        break
+                    elif (check_exists(d(textContains="GALAT")) or 
+                          check_exists(d(text="Dismiss")) or 
+                          check_exists(d(textContains="Perlu diperbaiki"))):
+                        modal_validasi_terbuka = True
+                        break
+                    time.sleep(0.3)
+
+            if is_galat_0_nik:
+                print(f"[CEK NIK -> SUBMIT] [SUKSES] Terdeteksi 'GALAT 0' setelah Cek NIK untuk IDPEL {idpel}! Langsung memproses submit & selesai...")
+                if not pause_proses_galat_0(idpel=idpel, row=row, keterangan="Setelah Cek NIK (GALAT 0)"):
+                    print(f"[HALT] Seluruh proses bot dihentikan secara manual oleh pengguna pada baris {row} (IDPEL: {idpel}).")
+                    return
+                res_submit = eksekusi_submit_dan_selesai(row, idpel, row_attempt)
+                if res_submit == "retry":
+                    continue
+                else:
+                    sukses_baris = True
+                    break
+            else:
+                print(f"[CEK NIK -> VALIDASI] Belum 'GALAT 0' setelah Cek NIK untuk IDPEL {idpel}. Menutup modal validasi & melanjutkan pengisian BLOK II, III, dan IV...")
+                if modal_validasi_terbuka or check_exists(d(text="Dismiss")):
+                    for _ in range(2):
+                        try:
+                            if check_exists(d(text="Dismiss")) or check_exists(d(textContains="Dismiss")):
+                                ketuk("Dismiss", sleep_after=SLEEP_SHORT)
+                                time.sleep(SLEEP_SHORT)
+                            else:
+                                break
+                        except Exception:
+                            break
 
             loop_swipe_statis(delta_y=-700, loop=3)
             isi_dan_verifikasi_no_telp(d, target_val='-', max_attempts=5)
@@ -3436,16 +4617,14 @@ def proses_update_reject_nik():
 
             # Catatan & Submit
             res_submit = isi_catatan_dan_submit(row, idpel, row_attempt)
-            if res_submit == "retry":
+            if res_submit == "stop":
+                print(f"[HALT] Seluruh proses bot dihentikan secara manual oleh pengguna pada baris {row} (IDPEL: {idpel}).")
+                return
+            elif res_submit == "retry":
                 continue
             else:
                 sukses_baris = True
                 break
-
-            # # Pause proses dengan pilihan stop seluruh proses atau lanjutkan proses
-            # if not konfirmasi_stop_atau_lanjut("Pause sebelum mengirim data (Kirim). Lanjutkan atau Stop seluruh proses?"):
-            #     print(f"[HALT] Seluruh proses bot dihentikan secara manual oleh pengguna pada baris {row} (IDPEL: {idpel}).")
-            #     return
 
 def main():
     try:
