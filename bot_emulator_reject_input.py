@@ -3433,22 +3433,24 @@ def eksekusi_ketuk_cek_id_pelanggan(arah_awal="down"):
         print("[BLOK I] Mengetuk tombol 'Cek ID Pelanggan' via ketuk()...")
         ketuk("Cek ID Pelanggan")
 
-    # Cek apakah progress bar / loading muncul. Jika belum muncul dalam 0.5 detik, ketuk ulang (retry)
-    time.sleep(0.5)
-    progress_el = d(resourceId="id.go.bpsfasih:id/card_progress")
-    if not progress_el.exists():
-        progress_el = d(className="android.widget.ProgressBar")
-
-    if not progress_el.exists():
-        print("[BLOK I] [RETRY] Loading belum terdeteksi, mencoba mengetuk ulang 'Cek ID Pelanggan'...")
-        if btn_cek and btn_cek.exists():
-            btn_cek.click()
-        else:
-            ketuk("Cek ID Pelanggan")
-
     print("[BLOK I] [LOADING] Menunggu loading 'Cek ID Pelanggan' selesai...")
     tunggu_loading(timeout=30)
     time.sleep(SLEEP_SHORT)
+
+    # Pemeriksaan Limit API check-idpln -> Jika terlampaui/limit, beralih mengetuk tombol Nomor Meter
+    limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
+    is_limit_cek = False
+    try:
+        xml_after = d.dump_hierarchy().lower()
+        if "check-idpln sudah terlampaui" in xml_after or "terlampaui (limit)" in xml_after or check_exists(d(textContains=limit_msg)):
+            is_limit_cek = True
+    except Exception:
+        is_limit_cek = check_exists(d(textContains=limit_msg))
+
+    if is_limit_cek:
+        print("[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln! Mengetuk tombol 'Cek Nomor Meter'...")
+        eksekusi_ketuk_cek_nometer(arah_awal="down")
+        return
 
     # Scan apakah muncul teks mengandung "Rincian 101a" atau "Rincian 101b" (tidak sama dengan hasil Cek ID Pelanggan)
     max_retry_rincian = 10
@@ -3468,8 +3470,9 @@ def eksekusi_ketuk_cek_id_pelanggan(arah_awal="down"):
             check_exists(d.xpath("//*[contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101a') or contains(translate(@text, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101a') or contains(translate(@content-desc, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rincian 101b')]"))
         )
 
-        if "check-idpln sudah terlampaui" in xml_cur or "terlampaui (limit)" in xml_cur:
-            print("[BLOK I] [LIMIT DETECTED] API check-idpln limit terdeteksi saat pengecekan rincian. Menghentikan retry 'Cek ID Pelanggan'.")
+        if "check-idpln sudah terlampaui" in xml_cur or "terlampaui (limit)" in xml_cur or check_exists(d(textContains=limit_msg)):
+            print("[BLOK I] [LIMIT DETECTED] API check-idpln limit terdeteksi saat pengecekan rincian. Mengetuk tombol 'Cek Nomor Meter'...")
+            eksekusi_ketuk_cek_nometer(arah_awal="down")
             break
 
         if not ada_rincian_101:

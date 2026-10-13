@@ -3494,19 +3494,21 @@ def proses_update_reject_nik():
                     print("[BLOK I] Mengetuk tombol 'Cek ID Pelanggan' via ketuk()...")
                     ketuk("Cek ID Pelanggan")
 
-                # Cek apakah progress bar / loading muncul. Jika belum muncul dalam 0.5 detik, ketuk ulang (retry)
-                time.sleep(0.5)
-                progress_el = d(resourceId="id.go.bpsfasih:id/card_progress")
-                if not progress_el.exists():
-                    progress_el = d(className="android.widget.ProgressBar")
-
-                if not progress_el.exists():
-                    print("[BLOK I] [RETRY] Loading belum terdeteksi, mencoba mengetuk ulang 'Cek ID Pelanggan'...")
-                    ketuk("Cek ID Pelanggan")
-
                 print("[BLOK I] [LOADING] Menunggu loading 'Cek ID Pelanggan' selesai...")
                 tunggu_loading(timeout=30)
                 time.sleep(SLEEP_SHORT)
+
+                # Pemeriksaan Limit API check-idpln -> Jika terlampaui/limit, beralih mengetuk tombol Nomor Meter
+                limit_msg = "Permintaan API check-idpln sudah terlampaui (limit)."
+                try:
+                    xml_after = d.dump_hierarchy().lower()
+                    is_limit_cek = "check-idpln sudah terlampaui" in xml_after or "terlampaui (limit)" in xml_after or check_exists(d(textContains=limit_msg))
+                except Exception:
+                    is_limit_cek = check_exists(d(textContains=limit_msg))
+
+                if is_limit_cek:
+                    print("[BLOK I] [LIMIT DETECTED] Terdeteksi limit API check-idpln! Mengetuk tombol 'Cek Nomor Meter'...")
+                    ketuk("Cek Nomor Meter")
             else:
                 print("[GALAT CHECK] [FALSE] Tidak terdeteksi kata 'Nomor Meter' / 'ID pelanggan PLN'. Menutup modal...")
                 print("[DISMISS] Mengetuk tombol 'Dismiss' pertama (modal Galat)...")
