@@ -33,7 +33,7 @@ if %errorLevel% neq 0 (
     if not exist ".git" (
         echo [1/2] Pertama kali dijalankan! Mengunduh seluruh project dari GitHub...
         git init
-        git remote add origin https://github.com/mobogemuichi-creator/bot_fasih.git
+        git remote add origin https://github.com/baliaga-repo/bot_fasih.git
         git fetch origin main
         git reset --hard origin/main
         git branch -M main
